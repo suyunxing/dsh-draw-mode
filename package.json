@@ -15,7 +15,6 @@
     "cordis.patch.yml",
     "workflows/**/*.json",
     "README.md",
-    "README.zh.md",
     "LICENSE",
     "icon-180.png"
   ],
