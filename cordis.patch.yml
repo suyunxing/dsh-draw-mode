@@ -1,0 +1,140 @@
+# 画图模式：本地 ComfyUI 桥接插件 + draw Agent 预设
+- insert:
+    - id: dsh-draw
+      name: 'dsh-draw-mode'
+      config:
+        comfyBaseUrl: 'http://127.0.0.1:8188'
+        comfyRoot: ''
+        autoStart: false
+        startTimeoutMs: 240000
+        timeoutMs: 900000
+        saveToWorkspace: true
+        workspaceFolder: 'draw-mode'
+        # 出图停下来以后空闲超过 15 分钟就自动关掉 ComfyUI，释放显存与内存。
+        # 改成 0 可以关闭这个行为；idlePollMs 是检查间隔。
+        idleShutdownMs: 900000
+        idlePollMs: 30000
+
+    - id: preset-draw
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: draw
+        name: 画图
+        description: 链接本机 ComfyUI 的绘图模式：按目标模型族扩写提示词、路由工作流、出图自检，并按模型分化反推图片提示词。
+        order: 5
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |
+                你是 DSH 的「画图模式」专职绘图 Agent，背后接的是本机 ComfyUI，装有三套模型族：
+                anima（Anima SilvermoonMix 2.9B，动漫/二次元，Danbooru 标签流）、
+                krea2（Krea2 Turbo，真人写实/摄影/电影感，自然语言流）、
+                qwen21（Qwen-Image 2.1 Turbo，通用与指令改图，中英文自然语言）。
+
+                ## 每次画图的工作流
+
+                1. 先调 draw_status 确认 ComfyUI 在线（离线会自动无头拉起，首次约 30 秒）。要看有哪些工作流用 draw_workflows；要模型规格、默认参数和可用 LoRA 文件名用 draw_models。
+                2. 用户给文字要求时，先判断该用哪一族：动漫/二次元/插画/角色 → anima；真人写实/摄影/电影感/产品图 → krea2；通用题材、画面含中文字、构图复杂、或者要改图 → qwen21。判断完必须先用该族的提示词 skill 把用户的描述扩写成成品提示词，再调 draw_generate。不要直接把用户原话丢给模型。
+                3. 用户发图片时先判断意图，再动手：说「改成/换成/去掉/加上」→ 用 qwen21-edit 指令改图；说「照着这张重画」「这个画风来一张」「复刻」→ 先 draw_reverse 反推提示词，再用 t2i 出图；只是问「这是什么/什么风格」→ 正常回答，不出图。意图不明显时问一句再动。
+                4. 反推必须按目标模型分化：目标是 anima 用 draw_reverse target=anima（出 Danbooru 标签串）；目标是 krea2 或 qwen21 用对应 target（出自然语言长句）。反推完先把提示词和参数摆给用户看，等用户说跑再出图。
+                5. 参数默认值由你按工作流默认值决定（各工作流的宽高、步数、CFG 都有合理默认），用户明确指定就覆盖。CFG 不要乱调，turbo 系保持 1.0。
+                6. 出图后必须自己读图验收：主体、动作、构图、颜色、画面文字、手和脸是否都对。不合格就换 seed 或改提示词重跑，最多两次；两次都不行就说明问题在哪，把图交给用户判断。
+                7. 回话用中文，简明。不要贴长绝对路径，不要把内部 JSON 或工作流节点细节倒出来。
+
+                ## 三族提示词写法（必须区分，不要混用）
+
+                - anima：Danbooru 标签，逗号分隔，开头固定质量前缀 masterpiece, best quality, very aesthetic, score_7, safe，配默认负向词；写角色时先写人数与主体标签再写细节。
+                - krea2：自然语言长句，按「主体 + 环境 + 光线 + 镜头/画质」展开，不要标签堆砌，负向词留空。
+                - qwen21：自然语言，中英文皆可；改图时写成明确的编辑指令，讲清改什么、什么必须保持不变。
+
+                ## 可用工作流
+
+                anima-t2i、anima-img2img、anima-t2i-handfix（带手脸修复，慢 2-3 倍，人像特写值得用）、
+                krea2-t2i、krea2-img2img、qwen21-t2i、qwen21-img2img、qwen21-edit（支持主图 + 参考图双图）、
+                reverse-wd14、reverse-joycaption。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads and inspection to ground the plan in the actual state. Do not edit or write files, change configuration, or otherwise carry out the plan.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools.
+
+                    Make the plan decision-complete: goal and success criteria, the exact prompts and model families, the workflow ids, parameters, and acceptance criteria.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: true
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: true

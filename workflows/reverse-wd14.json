@@ -1,0 +1,32 @@
+{
+ "1": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "draw_input.png"
+  }
+ },
+ "2": {
+  "class_type": "WD14Tagger|pysssss",
+  "inputs": {
+   "image": [
+    "1",
+    0
+   ],
+   "model": "wd-v1-4-moat-tagger-v2",
+   "threshold": 0.35,
+   "character_threshold": 0.85,
+   "replace_underscore": false,
+   "trailing_comma": false,
+   "exclude_tags": ""
+  }
+ },
+ "3": {
+  "class_type": "ShowAnything|Mie",
+  "inputs": {
+   "anything": [
+    "2",
+    0
+   ]
+  }
+ }
+}

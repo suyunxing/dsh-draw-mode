@@ -1,0 +1,54 @@
+{
+  "name": "dsh-draw-mode",
+  "version": "1.0.0",
+  "description": "Link a local ComfyUI server into DeepSeek Harness: workflow routing, parameter mapping, LoRA injection, headless auto-start, inline image delivery and per-model prompt reverse-engineering.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "workflows/**/*.json",
+    "README.md",
+    "README.zh.md",
+    "LICENSE",
+    "icon-180.png"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "author": "suyunxing <suyunxings@qq.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/suyunxing/dsh-draw-mode.git"
+  },
+  "homepage": "https://github.com/suyunxing/dsh-draw-mode",
+  "bugs": {
+    "url": "https://github.com/suyunxing/dsh-draw-mode/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "comfyui",
+    "image-generation",
+    "text-to-image",
+    "lora"
+  ]
+}
