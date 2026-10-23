@@ -16,8 +16,11 @@ const WF_DIR = path.join(HERE, 'workflows');
 
 const DEFAULTS = {
 	comfyBaseUrl: 'http://127.0.0.1:8188',
-	comfyRoot: 'D:/ai/ComfyUI-aki-v3.2',
-	autoStart: true,
+	/* ComfyUI 安装目录。留空表示「未配置」——本包不预设任何人的本机路径，
+	   请在 cordis.patch.yml 或设置里填你自己的目录。 */
+	comfyRoot: '',
+	/* 留空 comfyRoot 时不要尝试拉起进程，避免对着不存在的路径 spawn。 */
+	autoStart: false,
 	startTimeoutMs: 240000,
 	timeoutMs: 900000,
 	saveToWorkspace: true,
@@ -684,7 +687,13 @@ export function apply(ctx, config) {
 
 	const log = (line) => logs.push(`[${new Date().toISOString()}] ${line}`);
 
-	ctx.effect(() => registerPanelRoutes(ctx, cfg, log));
+	/* 面板路由挂在 web app 的 webServer 上，headless 部署根本不组装它。
+	   必须用 ctx.inject 跟随服务：apply 时直接 ctx.get('webServer') 只是「读一次」，
+	   webServer 还没起来就拿到 undefined，registerPanelRoutes 静默 return，
+	   一条路由都没注册，面板取 /draw-mode/api/state 落到静态兜底 → 接口异常：HTTP 404。 */
+	ctx.inject(['webServer'], (webCtx) => {
+		webCtx.effect(() => registerPanelRoutes(webCtx, cfg, log));
+	});
 
 	/* ------------------------------------------------------ 空闲自动关闭 */
 

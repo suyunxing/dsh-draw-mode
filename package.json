@@ -1,6 +1,6 @@
 {
   "name": "dsh-draw-mode",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Link a local ComfyUI server into DeepSeek Harness: workflow routing, parameter mapping, LoRA injection, headless auto-start, inline image delivery and per-model prompt reverse-engineering.",
   "type": "module",
   "main": "index.js",
