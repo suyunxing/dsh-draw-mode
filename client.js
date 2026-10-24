@@ -114,6 +114,12 @@ window.__ModuleLoader__.load({
 .dshdraw-dim {
         opacity: 0.72;
       }
+      .dshdraw-conf {
+        margin-top: 4px;
+        font-size: 11px;
+        line-height: 1.4;
+        word-break: break-all;
+      }
 
       .dshdraw-status {
   display: flex;
@@ -407,6 +413,15 @@ window.__ModuleLoader__.load({
         ? `空闲 ${Math.round(idle.idleMs / 60000)} 分钟后自动关闭${idle.scope === 'port' ? '（含端口上其他进程）' : '（仅本插件启动的进程）'}${online ? `（剩 ${Math.max(0, Math.round(idle.remainingMs / 60000))} 分）` : ''}`
         : '';
 
+      const config = state && state.config;
+      const configHint = config
+        ? [
+          config.modelsRoot ? `模型 ${config.modelsRoot}` : '模型目录未配置',
+          config.outputDir ? `出图 ${config.outputDir}` : (config.saveToWorkspace ? '出图存会话工作区' : '不保存出图'),
+          !online && !config.comfyMain ? '未配置 ComfyUI 启动路径' : '',
+        ].filter(Boolean).join(' · ')
+        : '';
+
       const statusLine = stats
         ? [
           h('span', { key: 'd', className: ['dshdraw-dot', online ? 'dshdraw-dotOn' : 'dshdraw-dotOff'].join(' ') }),
@@ -457,6 +472,7 @@ window.__ModuleLoader__.load({
         ]),
 
         h('div', { key: 'status', className: 'dshdraw-status' }, statusLine),
+        configHint ? h('div', { key: 'conf', className: 'dshdraw-dim dshdraw-conf' }, configHint) : null,
         failed ? h('div', { key: 'err', className: 'dshdraw-error' }, `接口异常：${failed}`) : null,
 
         h('div', { key: 'families', className: 'dshdraw-section' }, [

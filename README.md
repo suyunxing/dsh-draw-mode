@@ -19,7 +19,7 @@ Links a local **ComfyUI** server into DeepSeek Harness and gives the agent a dra
 
 - A local (or LAN) ComfyUI instance, **v0.37.0 or newer**: the Qwen-Image 2.1 text encoder node (`TextEncodeQwenImage21`) is built in from that release on.
 - Node >= 22. No `@deepseek-ai/*` package is imported; the bundle only references host-provided services.
-- The checkpoints and custom nodes listed below. The bundled workflows name files **exactly**; a differently named file works only after editing the workflow JSON, or after renaming the file to match.
+- The checkpoints and custom nodes listed below. The bundled workflows name files **exactly**; a differently named file works after pointing `modelMap` at it (no JSON editing), or after editing the workflow JSON, or after renaming the file to match.
 
 ### Checkpoints the bundled workflows load
 
@@ -64,9 +64,41 @@ You only need the nodes of the workflows you actually call:
 dsh plugin --profile <your-profile> add dsh-draw-mode
 ```
 
-## Configuration
+## Pointing it at your own ComfyUI
 
-Set these in your profile's `cordis.patch.yml`. **`comfyRoot` ships empty on purpose** — point it at your own ComfyUI installation if you want auto-start:
+Nothing is hard-coded to the author's machine. Every path is a configuration value, and **the plugin needs no local paths at all** when ComfyUI is already running somewhere reachable: images go in through `POST /upload/image` and come back through `GET /view`, so neither the ComfyUI `input/` nor `output/` directory has to be visible to this process.
+
+Three ways to use it, from least to most configuration:
+
+1. **ComfyUI already running** (any host, any port) — set `comfyBaseUrl` and nothing else.
+2. **Let the plugin start it** — set `comfyRoot` (or `comfyMain` + `comfyPython`) and `autoStart: true`.
+3. **Bring your own models / workflows** — add `modelsRoot`, `workflowsDir` and `modelMap` to check and swap files without editing the bundled JSON.
+
+### Options
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `comfyBaseUrl` | `http://127.0.0.1:8188` | Where ComfyUI listens. Remote/LAN and non-default ports go here. |
+| `comfyRoot` | `''` | ComfyUI install directory. Only used for headless start and path derivation. |
+| `comfyPython` | `''` | Python executable. Overrides `comfyRoot` derivation; a bare command name (`python3`) is taken from `PATH`. |
+| `comfyMain` | `''` | `main.py` of ComfyUI. Overrides derivation. |
+| `comfyWorkdir` | `''` | Working directory for the spawned process; defaults to `main.py`'s folder. |
+| `comfyArgs` | `[]` | Extra CLI args, e.g. `['--lowvram']`. |
+| `autoStart` | `false` | Start ComfyUI headlessly when a tool cannot reach it. Needs the paths above. |
+| `startTimeoutMs` | `240000` | How long to wait for a spawned ComfyUI to answer. |
+| `timeoutMs` | `900000` | Per-generation timeout. |
+| `modelsRoot` | `''` | `ComfyUI/models`. Used for a local "is the file there?" check; `''` derives it from `comfyRoot`. |
+| `workflowsDir` | `''` | Extra workflow library (`manifest.json` + JSON graphs). Same `id` overrides a bundled one. |
+| `modelMap` | `{}` | `{ 'bundled-name.gguf': 'my-name.gguf' }` — rewrite checkpoint names at load time instead of editing JSON. |
+| `outputDir` | `''` | Fixed folder for generated images. When set, images are always written there. |
+| `saveToWorkspace` | `true` | Otherwise: save into the session workspace under `workspaceFolder`. |
+| `workspaceFolder` | `'draw-mode'` | Folder inside the session workspace (absolute paths are used as-is). |
+| `idleShutdown` | *(unset)* | Explicit switch: `false` never shuts down, `true` always uses `idleShutdownMs` (15 min when unset). |
+| `idleShutdownMs` | `0` | Idle delay before stopping ComfyUI. `0` = disabled. |
+| `idlePollMs` | `30000` | How often the idle check runs. |
+| `idleShutdownScope` | `'spawned'` | `spawned` stops only what this plugin started; `port` also stops whatever listens on `comfyBaseUrl`'s port. |
+
+All path values accept `~`, `%VAR%`, `${VAR}` and relative paths (resolved against `comfyRoot`).
 
 ```yaml
 - insert:
@@ -74,16 +106,30 @@ Set these in your profile's `cordis.patch.yml`. **`comfyRoot` ships empty on pur
       name: 'dsh-draw-mode'
       config:
         comfyBaseUrl: 'http://127.0.0.1:8188'
-        comfyRoot: ''            # e.g. 'D:/ComfyUI' — needed only for autoStart
-        autoStart: false         # start ComfyUI on demand
+        # --- start ComfyUI ourselves (optional) ---
+        comfyRoot: ''            # e.g. 'D:/ComfyUI_windows_portable' or '/opt/ComfyUI'
+        comfyPython: ''          # e.g. 'D:/ComfyUI_windows_portable/python_embeded/python.exe'
+        comfyMain: ''            # e.g. 'D:/ComfyUI_windows_portable/ComfyUI/main.py'
+        comfyWorkdir: ''
+        comfyArgs: []
+        autoStart: false
         startTimeoutMs: 240000
-        timeoutMs: 900000        # per-generation timeout
+        timeoutMs: 900000
+        # --- models / workflows (optional) ---
+        modelsRoot: ''           # e.g. 'D:/ComfyUI_windows_portable/ComfyUI/models'
+        workflowsDir: ''         # your own manifest.json + workflow JSON
+        modelMap: {}             # { 'qwen_image_2.1_turbo_Q4_K_M.gguf': 'my_qwen.gguf' }
+        # --- where images land ---
+        outputDir: ''            # e.g. '~/Pictures/draw'
         saveToWorkspace: true
         workspaceFolder: 'draw-mode'
-        idleShutdownMs: 0        # >0 enables idle shutdown, e.g. 900000 for 15 min
+        # --- idle shutdown (off by default) ---
+        idleShutdownMs: 0
         idlePollMs: 30000
-        idleShutdownScope: 'spawned'  # or 'port' to also stop a ComfyUI you started yourself
+        idleShutdownScope: 'spawned'
 ```
+
+`draw_status` echoes the resolved values back — which `main.py`/`python` it will spawn, which `modelsRoot` it checks, which folder images go to, and which model files are missing — so you can verify the configuration without guessing.
 
 ## Notes
 
@@ -101,7 +147,37 @@ Set these in your profile's `cordis.patch.yml`. **`comfyRoot` ships empty on pur
 - **侧栏面板**显示桥接状态、显卡、工作流库与最近出图缩略图，数据来自 host 半只读 HTTP 路由，与 Web GUI 同源。
 - **可选自动启停**（两项都**默认关闭**）：需要时拉起 ComfyUI，队列空闲一段时间后自动关掉释放显存。空闲关闭默认只结束本插件自己拉起的那个进程；把 `idleShutdownScope` 设成 `port` 才会连你手动启动的 ComfyUI 一起关掉。
 
-配置项同上，`comfyRoot` 默认留空，只有想用自动启动时才需要填你自己的 ComfyUI 路径；`idleShutdownMs` 默认 0，即不替你结束任何进程。
+### 配置你自己的 ComfyUI
+
+插件不预设任何人的本机路径。只要 ComfyUI 已经开着（任何机器、任何端口），**一个路径都不用配**：输入图走 `POST /upload/image` 上传，出图走 `GET /view` 取回，所以本进程不需要能看见 ComfyUI 的 `input/` 和 `output/` 目录。
+
+三种用法，配置量从少到多：
+
+1. **ComfyUI 已经开着**（远程也行）——只配 `comfyBaseUrl`。
+2. **让插件自己拉起**——配 `comfyRoot`（或 `comfyMain` + `comfyPython`）并设 `autoStart: true`。
+3. **换成你自己的模型 / 工作流**——配 `modelsRoot`、`workflowsDir`、`modelMap`，不用改内置 JSON。
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `comfyBaseUrl` | `http://127.0.0.1:8188` | ComfyUI 地址；远程、非默认端口都改这里。 |
+| `comfyRoot` | `''` | ComfyUI 安装目录，只用于无头启动和路径推导。 |
+| `comfyPython` | `''` | python 可执行文件；只写命令名（如 `python3`）则从 `PATH` 找。 |
+| `comfyMain` | `''` | ComfyUI 的 `main.py`。 |
+| `comfyWorkdir` | `''` | 启动进程的工作目录，默认 `main.py` 所在目录。 |
+| `comfyArgs` | `[]` | 额外命令行参数，如 `['--lowvram']`。 |
+| `autoStart` | `false` | 连不上时是否无头拉起。 |
+| `modelsRoot` | `''` | `ComfyUI/models`；用于本地检查「工作流要的模型在不在」，留空按 `comfyRoot` 推导。 |
+| `workflowsDir` | `''` | 额外工作流库（`manifest.json` + JSON）；同 `id` 覆盖内置。 |
+| `modelMap` | `{}` | `{ '内置名.gguf': '我的名.gguf' }`，加载时改名，不必改 JSON。 |
+| `outputDir` | `''` | 固定出图目录；配了就一定存这里。 |
+| `saveToWorkspace` | `true` | 否则存进会话工作区的 `workspaceFolder`。 |
+| `workspaceFolder` | `'draw-mode'` | 会话工作区内的子目录。 |
+| `idleShutdown` | *(未设)* | 显式开关：`false` 永不关，`true` 按 `idleShutdownMs`（未设时长则 15 分钟）。 |
+| `idleShutdownMs` | `0` | 空闲多久后关闭；`0` = 关闭该功能。 |
+| `idlePollMs` | `30000` | 空闲检查间隔。 |
+| `idleShutdownScope` | `'spawned'` | `spawned` 只关本插件拉起的；`port` 连你手动启动的一起关。 |
+
+所有路径都支持 `~`、`%VAR%`、`${VAR}` 和相对路径（按 `comfyRoot` 解析）。配置对不对不用猜——`draw_status` 会把解析结果回显出来：会 spawn 哪个 `main.py` / `python`、检查哪个 `modelsRoot`、出图存哪、以及还缺哪些模型文件。
 
 依赖见上面的英文清单，要点：ComfyUI 需 **v0.37.0 以上**（Qwen-Image 2.1 的文本编码节点是内置的）；工作流写死了具体文件名，换文件得改工作流 JSON 或把文件改名；自定义节点按族区分——Anima 的文生图只要原版 ComfyUI，Krea 2 / Qwen 需要 ComfyUI-GGUF，手脸修复要两个 Impact 包，两条反推分别要 WD14-Tagger / JoyCaption 加 MieNodes。
 

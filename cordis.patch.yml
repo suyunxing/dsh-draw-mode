@@ -2,19 +2,46 @@
 - insert:
     - id: dsh-draw
       name: 'dsh-draw-mode'
+      # 下面所有路径都支持 ~、%VAR%、${VAR} 和相对路径（按 comfyRoot 解析）。
+      # 全部留空也能用：只要 ComfyUI 已经开着（默认连 127.0.0.1:8188），
+      # 出图、传图、取图都走 HTTP，不读本机任何目录。
       config:
+        # ① 连哪个 ComfyUI：远程或非默认端口改这里。
         comfyBaseUrl: 'http://127.0.0.1:8188'
+
+        # ② ComfyUI 装在哪：只有「无头自动启动」和路径推导要用。
+        #    留空 = 不推导，配合 autoStart: false 表示「我自己手动开 ComfyUI」。
+        #    常见值：Windows 便携包 D:\ComfyUI_windows_portable；源码安装 /opt/ComfyUI；ComfyUI Desktop 填到 resources/ComfyUI。
         comfyRoot: ''
-        autoStart: false
+        # 推导不出或布局特殊时，逐项指定（优先级高于 comfyRoot）：
+        comfyPython: ''      # 例如 D:\ComfyUI_windows_portable\python_embeded\python.exe 或 /opt/ComfyUI/venv/bin/python
+        comfyMain: ''        # 例如 D:\ComfyUI_windows_portable\ComfyUI\main.py
+        comfyWorkdir: ''     # 进程工作目录，默认 main.py 所在目录
+        comfyArgs: []        # 额外命令行参数，例如 ['--lowvram', '--preview-method', 'auto']
+        autoStart: false     # true = 连不上就无头拉起（需要上面的路径）
         startTimeoutMs: 240000
         timeoutMs: 900000
+
+        # ③ 模型在哪：只用于本地检查「工作流要的模型文件在不在」。
+        #    留空按 <comfyRoot>/ComfyUI/models 推导；ComfyUI 在线时以它的 /object_info 为准。
+        modelsRoot: ''
+        # ④ 自己的工作流库（manifest.json + 工作流 JSON）；同 id 覆盖内置。
+        workflowsDir: ''
+        # ⑤ 模型文件名映射：内置工作流写死的名字 → 你本机的名字。
+        #   例如 { 'qwen_image_2.1_turbo_Q4_K_M.gguf': 'qwen_image_2.1_turbo_Q8_0.gguf' }
+        modelMap: {}
+
+        # ⑥ 出图存哪：outputDir 优先（配了就一定存）；否则按 saveToWorkspace 存进会话工作区。
+        outputDir: ''
         saveToWorkspace: true
         workspaceFolder: 'draw-mode'
-        # 空闲自动关闭 ComfyUI（释放显存）。默认 0 = 关闭：不显式设置就不会替你结束任何进程。
-        # 想开启就填毫秒数，例如 900000 = 空闲 15 分钟后关闭；idlePollMs 是检查间隔。
+
+        # ⑦ 空闲自动关闭 ComfyUI（释放显存）。默认关：不显式设置就不会替你结束任何进程。
+        #    idleShutdown 是显式开关：false 强制关，true 强制开（时长用 idleShutdownMs，
+        #    未设时长则按 15 分钟）；不设则看 idleShutdownMs，>0 才开启。
         idleShutdownMs: 0
         idlePollMs: 30000
-        # 空闲关闭的作用范围：'spawned' 只关本插件自己拉起的 ComfyUI（默认）；
+        # 作用范围：'spawned' 只关本插件自己拉起的 ComfyUI（默认）；
         # 'port' 会关掉 comfyBaseUrl 端口上的任何进程，包括你手动启动的那个。
         idleShutdownScope: 'spawned'
 
@@ -37,7 +64,7 @@
 
                 ## 每次画图的工作流
 
-                1. 先调 draw_status 确认 ComfyUI 在线（离线会自动无头拉起，首次约 30 秒）。要看有哪些工作流用 draw_workflows；要模型规格、默认参数和可用 LoRA 文件名用 draw_models。
+                1. 先调 draw_status 确认 ComfyUI 在线（配置了启动路径并开启 autoStart 时，离线会自动无头拉起，首次约 30 秒；否则提示用户手动启动 ComfyUI）。要看有哪些工作流用 draw_workflows；要模型规格、默认参数和可用 LoRA 文件名用 draw_models。
                 2. 用户给文字要求时，先判断该用哪一族：动漫/二次元/插画/角色 → anima；真人写实/摄影/电影感/产品图 → krea2；通用题材、画面含中文字、构图复杂、或者要改图 → qwen21。判断完必须先用该族的提示词 skill 把用户的描述扩写成成品提示词，再调 draw_generate。不要直接把用户原话丢给模型。
                 3. 用户发图片时先判断意图，再动手：说「改成/换成/去掉/加上」→ 用 qwen21-edit 指令改图；说「照着这张重画」「这个画风来一张」「复刻」→ 先 draw_reverse 反推提示词，再用 t2i 出图；只是问「这是什么/什么风格」→ 正常回答，不出图。意图不明显时问一句再动。
                 4. 反推必须按目标模型分化：目标是 anima 用 draw_reverse target=anima（出 Danbooru 标签串）；目标是 krea2 或 qwen21 用对应 target（出自然语言长句）。反推完先把提示词和参数摆给用户看，等用户说跑再出图。

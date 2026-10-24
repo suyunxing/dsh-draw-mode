@@ -7,7 +7,8 @@
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -15,18 +16,43 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WF_DIR = path.join(HERE, 'workflows');
 
 const DEFAULTS = {
+	/* ---------------------------------------------------------- 连接 */
 	comfyBaseUrl: 'http://127.0.0.1:8188',
-	/* ComfyUI 安装目录。留空表示「未配置」——本包不预设任何人的本机路径，
-	   请在 cordis.patch.yml 或设置里填你自己的目录。 */
+	/* ComfyUI 安装目录。只用于「无头启动」和路径推导；连远程/已手动启动的
+	   ComfyUI 时留空即可，出图与传图都走 HTTP，不读本机目录。 */
 	comfyRoot: '',
-	/* 留空 comfyRoot 时不要尝试拉起进程，避免对着不存在的路径 spawn。 */
+	/* 无头启动的三个具体路径。留空则按 comfyRoot 推导常见布局
+	   （便携包 python/python.exe + ComfyUI/main.py，源码安装 venv/bin/python），
+	   推导不出来再退回 PATH 里的 python。任何一项都能单独覆盖。 */
+	comfyPython: '',
+	comfyMain: '',
+	comfyWorkdir: '',
+	/* 额外传给 ComfyUI 的命令行参数，例如 ['--lowvram', '--preview-method', 'auto']。 */
+	comfyArgs: [],
 	autoStart: false,
 	startTimeoutMs: 240000,
 	timeoutMs: 900000,
+
+	/* ------------------------------------------------------ 模型 / 工作流 */
+	/* 模型根目录，用于「离线检查工作流要的文件在不在」。留空则按 comfyRoot 推导
+	   <comfyRoot>/ComfyUI/models。ComfyUI 在线时以它的 /object_info 为准。 */
+	modelsRoot: '',
+	/* 额外的工作流目录（放自己的 manifest.json + 工作流 JSON），与内置库合并；
+	   同 id 覆盖内置。 */
+	workflowsDir: '',
+	/* 模型文件名映射：内置工作流写死的名字 → 你本机的名字。
+	   例如 { 'qwen_image_2.1_turbo_Q4_K_M.gguf': 'qwen_image_2.1_turbo_Q8_0.gguf' } */
+	modelMap: {},
+
+	/* ---------------------------------------------------------- 出图保存 */
+	/* 固定保存目录（绝对路径，支持 ~ 与 %VAR%）。设置后优先于 workspaceFolder。 */
+	outputDir: '',
 	saveToWorkspace: true,
 	workspaceFolder: 'draw-mode',
-	/* 空闲自动关闭：出图停下来以后，超过这个时长没有任何新任务就关掉 ComfyUI 释放显存。
-	   默认 0 = 不开启：不显式配置就不会替你结束任何进程。 */
+	/* 空闲自动关闭的显式开关：false 强制关闭，true 强制开启（用下面的时长）。
+	   不设（默认）则看 idleShutdownMs：>0 才开启。 */
+	idleShutdown: undefined,
+	/* 空闲多久后关闭（毫秒）。默认 0 = 不开启：不显式配置就不会替你结束任何进程。 */
 	idleShutdownMs: 0,
 	idlePollMs: 30000,
 	/* 空闲关闭的作用范围。'spawned'（默认）只结束本插件自己无头拉起的那个进程；
@@ -40,6 +66,8 @@ const ACTIVITY = {
 	last: Date.now(),
 	lastShutdownAt: 0,
 	lastStopPids: [],
+	/* 最近一次真正落盘的目录，面板据此列图；没有固定 outputDir 时用它兜底。 */
+	lastSaveDir: '',
 };
 
 /** 本插件自己无头启动的 ComfyUI 进程。 */
@@ -54,15 +82,68 @@ const MEDIA_EXT = {
 
 /* ------------------------------------------------------------------ 路径 */
 
-function roots(cfg) {
-	const root = cfg.comfyRoot;
-	return {
-		python: path.join(root, 'python', 'python.exe'),
-		main: path.join(root, 'ComfyUI', 'main.py'),
-		cwd: path.join(root, 'ComfyUI'),
-		input: path.join(root, 'ComfyUI', 'input'),
-		output: path.join(root, 'ComfyUI', 'output'),
+/** 展开 ~、%VAR%、${VAR}；相对路径按 base 解析。空值返回空串表示「未配置」。 */
+function expandPath(value, base) {
+	if (typeof value !== 'string') return '';
+	let v = value.trim();
+	if (v === '') return '';
+	if (v === '~' || v.startsWith('~/') || v.startsWith('~\\')) v = path.join(homedir(), v.slice(1));
+	v = v.replace(/%([^%]+)%/g, (m, name) => process.env[name] ?? m);
+	v = v.replace(/\$\{([^}]+)\}/g, (m, name) => process.env[name] ?? m);
+	if (path.isAbsolute(v)) return path.normalize(v);
+	return base ? path.resolve(base, v) : path.resolve(v);
+}
+
+function configRoot(cfg) {
+	return expandPath(cfg?.comfyRoot, process.cwd());
+}
+
+/**
+ * python 这类「可能是路径、也可能是 PATH 里的命令名」的配置：
+ * 像路径就展开，像命令名（python3）就原样保留，别把它拼成绝对路径。
+ */
+function commandOrPath(value, base) {
+	const raw = typeof value === 'string' ? value.trim() : '';
+	if (raw === '') return '';
+	const looksLikePath = raw.includes('/') || raw.includes('\\') || raw.startsWith('~')
+		|| raw.includes('%') || raw.includes('${') || raw === '.' || raw === '..';
+	return looksLikePath ? expandPath(raw, base) : raw;
+}
+
+/**
+ * 无头启动需要的路径。优先级：显式配置 > comfyRoot 下的常见布局 > PATH。
+ * 覆盖便携包（python/python.exe + ComfyUI/main.py）、源码安装（venv/bin/python + main.py）、
+ * 以及 ComfyUI Desktop 那种直接给 main.py 的情况。
+ */
+function spawnPaths(cfg) {
+	const root = configRoot(cfg);
+	const first = (list) => {
+		const paths = list.filter(Boolean);
+		return paths.find((p) => existsSync(p)) ?? paths[0] ?? '';
 	};
+	const main = expandPath(cfg.comfyMain, root) || first([
+		root && path.join(root, 'ComfyUI', 'main.py'),
+		root && path.join(root, 'main.py'),
+	]);
+	const python = commandOrPath(cfg.comfyPython, root) || first([
+		root && path.join(root, 'python', 'python.exe'),
+		root && path.join(root, 'python_embeded', 'python.exe'),
+		root && path.join(root, 'venv', 'bin', 'python'),
+		root && path.join(root, '.venv', 'bin', 'python'),
+	]) || (process.platform === 'win32' ? 'python.exe' : 'python3');
+	const cwd = expandPath(cfg.comfyWorkdir, root) || (main ? path.dirname(main) : root);
+	return { root, main, python, cwd };
+}
+
+/** 模型根目录：显式配置优先，否则按 comfyRoot 推导。 */
+function modelsRoot(cfg) {
+	const root = configRoot(cfg);
+	return expandPath(cfg.modelsRoot, root) || (root ? path.join(root, 'ComfyUI', 'models') : '');
+}
+
+/** 固定保存目录；未配置返回空串，表示按 workspaceFolder 存进会话工作区。 */
+function fixedOutputDir(cfg) {
+	return expandPath(cfg.outputDir, configRoot(cfg));
 }
 
 /* ------------------------------------------------------------------ HTTP */
@@ -98,12 +179,29 @@ async function comfyUp(cfg) {
 /* --------------------------------------------------------------- 启动 */
 
 function startComfy(cfg) {
-	const r = roots(cfg);
-	if (!existsSync(r.python)) throw new Error(`找不到 ComfyUI 的 python：${r.python}`);
-	if (!existsSync(r.main)) throw new Error(`找不到 ComfyUI 的 main.py：${r.main}`);
-	const port = new URL(cfg.comfyBaseUrl).port || '8188';
-	const child = spawn(r.python, [r.main, '--listen', '127.0.0.1', '--port', String(port), '--disable-auto-launch'], {
-		cwd: r.cwd,
+	const p = spawnPaths(cfg);
+	if (!p.main) {
+		throw new Error('没有配置 ComfyUI 的启动路径：请设置 comfyRoot（安装目录）或 comfyMain（main.py 的完整路径）');
+	}
+	if (!existsSync(p.main)) {
+		throw new Error(`找不到 ComfyUI 的 main.py：${p.main}。请检查 comfyRoot / comfyMain 配置`);
+	}
+	/* python 允许是 PATH 里的命令名（python3），只有像路径时才做存在性检查。 */
+	const pathLike = p.python.includes('/') || p.python.includes('\\');
+	if (pathLike && !existsSync(p.python)) {
+		throw new Error(`找不到 ComfyUI 使用的 python：${p.python}。请检查 comfyRoot / comfyPython 配置`);
+	}
+	let url;
+	try {
+		url = new URL(cfg.comfyBaseUrl);
+	} catch {
+		throw new Error(`comfyBaseUrl 不是合法地址：${cfg.comfyBaseUrl}`);
+	}
+	const host = url.hostname || '127.0.0.1';
+	const port = url.port || '8188';
+	const extra = Array.isArray(cfg.comfyArgs) ? cfg.comfyArgs.map(String) : [];
+	const child = spawn(p.python, [p.main, '--listen', host, '--port', String(port), '--disable-auto-launch', ...extra], {
+		cwd: p.cwd || path.dirname(p.main),
 		detached: true,
 		stdio: 'ignore',
 		windowsHide: true,
@@ -117,7 +215,7 @@ async function ensureComfy(cfg, log) {
 	ACTIVITY.last = Date.now();
 	const stats = await systemStats(cfg);
 	if (stats) return { started: false, stats };
-	if (!cfg.autoStart) throw new Error(`ComfyUI 未在 ${cfg.comfyBaseUrl} 上响应，且 autoStart 已关闭`);
+	if (!cfg.autoStart) throw new Error(`ComfyUI 未在 ${cfg.comfyBaseUrl} 上响应，且 autoStart 已关闭（可以手动启动 ComfyUI，或把 comfyBaseUrl 改成实际地址）`);
 	const pid = startComfy(cfg);
 	if (log) log(`ComfyUI 未运行，已无头启动（pid ${pid}），等待就绪…`);
 	const deadline = Date.now() + cfg.startTimeoutMs;
@@ -126,7 +224,7 @@ async function ensureComfy(cfg, log) {
 		const s = await systemStats(cfg);
 		if (s) return { started: true, stats: s };
 	}
-	throw new Error(`ComfyUI 启动超时（${Math.round(cfg.startTimeoutMs / 1000)}s）。请手动检查 ${cfg.comfyRoot}`);
+	throw new Error(`ComfyUI 启动超时（${Math.round(cfg.startTimeoutMs / 1000)}s）。请手动检查 comfyRoot/comfyMain 配置，或先用 draw_status 看解析出的路径`);
 }
 
 function sleep(ms) {
@@ -223,14 +321,54 @@ async function stopComfy(cfg, log) {
 
 /* --------------------------------------------------------- 工作流库 */
 
-async function loadManifest() {
-	const raw = await readFile(path.join(WF_DIR, 'manifest.json'), 'utf8');
-	return JSON.parse(raw);
+async function readManifestAt(dir) {
+	try {
+		const raw = await readFile(path.join(dir, 'manifest.json'), 'utf8');
+		const parsed = JSON.parse(raw);
+		return parsed && Array.isArray(parsed.workflows) ? parsed : null;
+	} catch {
+		return null;
+	}
 }
 
-async function loadWorkflow(entry) {
-	const raw = await readFile(path.join(WF_DIR, entry.file), 'utf8');
-	return JSON.parse(raw);
+/**
+ * 工作流库 = 内置库 + workflowsDir（可选）。同 id 时用户目录覆盖内置，
+ * 其余按 id 去重，内置顺序在前。每条都带上它所在目录，加载时按目录取文件。
+ */
+async function loadManifest(cfg) {
+	const merged = new Map();
+	const builtin = await readManifestAt(WF_DIR);
+	for (const wf of builtin?.workflows ?? []) merged.set(wf.id, { ...wf, __dir: WF_DIR });
+	const extraDir = expandPath(cfg?.workflowsDir, configRoot(cfg));
+	if (extraDir && path.resolve(extraDir) !== path.resolve(WF_DIR)) {
+		const extra = await readManifestAt(extraDir);
+		for (const wf of extra?.workflows ?? []) merged.set(wf.id, { ...wf, __dir: extraDir, __custom: true });
+	}
+	return { version: builtin?.version, workflows: [...merged.values()] };
+}
+
+/** 把工作流里写死的模型文件名换成用户本机的文件名（modelMap）。 */
+function applyModelMap(wf, cfg) {
+	const map = cfg?.modelMap;
+	if (!map || typeof map !== 'object' || Array.isArray(map)) return;
+	const pairs = Object.entries(map).filter(([from, to]) => typeof from === 'string' && from && typeof to === 'string' && to);
+	if (pairs.length === 0) return;
+	for (const node of Object.values(wf)) {
+		if (!node?.inputs) continue;
+		for (const [key, value] of Object.entries(node.inputs)) {
+			if (typeof value !== 'string') continue;
+			const hit = pairs.find(([from]) => from === value);
+			if (hit) node.inputs[key] = hit[1];
+		}
+	}
+}
+
+async function loadWorkflow(cfg, entry) {
+	const dir = entry.__dir ?? WF_DIR;
+	const raw = await readFile(path.join(dir, entry.file), 'utf8');
+	const wf = JSON.parse(raw);
+	applyModelMap(wf, cfg);
+	return wf;
 }
 
 /* --------------------------------------------------- 参数落位 / LoRA */
@@ -345,20 +483,44 @@ function findAttachments(exec, spec) {
 	return [];
 }
 
+/** 通过 ComfyUI 的 /upload/image 传图，返回 LoadImage 能用的文件名（可能带 subfolder/）。 */
+async function uploadImage(cfg, name, data, type = 'image/png') {
+	const base = cfg.comfyBaseUrl.replace(/\/+$/, '');
+	const form = new FormData();
+	form.append('image', new Blob([data], { type }), name);
+	form.append('overwrite', 'true');
+	form.append('type', 'input');
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 120000);
+	let res;
+	try {
+		res = await fetch(base + '/upload/image', { method: 'POST', body: form, signal: controller.signal });
+	} finally {
+		clearTimeout(timer);
+	}
+	const text = await res.text();
+	if (!res.ok) throw new Error(`上传输入图失败（HTTP ${res.status}）：${text.slice(0, 500)}`);
+	let body;
+	try {
+		body = JSON.parse(text);
+	} catch {
+		throw new Error(`上传输入图返回了非 JSON 内容：${text.slice(0, 300)}`);
+	}
+	const saved = body?.name ?? name;
+	const sub = typeof body?.subfolder === 'string' ? body.subfolder.trim() : '';
+	return sub ? `${sub}/${saved}` : saved;
+}
+
 /**
- * 把一张图落到 ComfyUI 的 input 目录，返回文件名。
+ * 把一张图送进 ComfyUI 的 input（走 HTTP 上传，不碰本机目录），返回文件名。
  * spec 可以是本地绝对路径，或附件的 sha256。缺省取对话里最新的图。
  */
 async function stageImage(ctx, exec, cfg, spec, fallbackName) {
-	const r = roots(cfg);
-	await mkdir(r.input, { recursive: true });
-
 	if (typeof spec === 'string' && spec.trim().length > 0 && !digestOf(spec) && existsSync(spec)) {
 		const data = await readFile(spec);
 		const ext = (path.extname(spec) || '.png').toLowerCase();
 		const name = `draw_${randomUUID().slice(0, 8)}${ext}`;
-		await writeFile(path.join(r.input, name), data);
-		return name;
+		return await uploadImage(cfg, name, data);
 	}
 
 	const attachments = ctx.get?.('attachments');
@@ -370,8 +532,7 @@ async function stageImage(ctx, exec, cfg, spec, fallbackName) {
 	const stored = await attachments.readImage(refs[0], exec?.signal);
 	const ext = MEDIA_EXT[stored.ref.mediaType] ?? '.png';
 	const name = `draw_${randomUUID().slice(0, 8)}${ext}`;
-	await writeFile(path.join(r.input, name), Buffer.from(stored.data));
-	return name;
+	return await uploadImage(cfg, name, Buffer.from(stored.data), stored.ref.mediaType ?? 'image/png');
 }
 
 /* --------------------------------------------------------- 提交 / 等待 */
@@ -422,23 +583,36 @@ function joinChars(value) {
 	return value === undefined || value === null ? '' : String(value);
 }
 
+/** 从 ComfyUI 的 /view 取回产物（不读本机 output 目录，远程 ComfyUI 也能用）。 */
 async function collectImages(cfg, entry) {
-	const r = roots(cfg);
-	const files = [];
+	const base = cfg.comfyBaseUrl.replace(/\/+$/, '');
+	const refs = [];
 	for (const output of Object.values(entry.outputs ?? {})) {
 		for (const image of output?.images ?? []) {
 			if (!image?.filename) continue;
-			files.push({
+			refs.push({
 				filename: image.filename,
-				absolute: path.join(r.output, image.subfolder ?? '', image.filename),
+				subfolder: image.subfolder ?? '',
+				type: image.type ?? 'output',
 			});
 		}
 	}
 	const out = [];
-	for (const file of files) {
-		if (!existsSync(file.absolute)) continue;
-		const data = await readFile(file.absolute);
-		out.push({ ...file, data });
+	for (const ref of refs) {
+		const query = new URLSearchParams({ filename: ref.filename, subfolder: ref.subfolder, type: ref.type });
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 120000);
+		let res;
+		try {
+			res = await fetch(`${base}/view?${query}`, { signal: controller.signal });
+		} catch (err) {
+			clearTimeout(timer);
+			throw new Error(`从 ComfyUI 取图失败（${ref.filename}）：${err?.message ?? err}`);
+		}
+		clearTimeout(timer);
+		if (!res.ok) throw new Error(`从 ComfyUI 取图失败（${ref.filename}，HTTP ${res.status}）`);
+		const data = Buffer.from(await res.arrayBuffer());
+		out.push({ ...ref, data });
 	}
 	return out;
 }
@@ -461,10 +635,18 @@ function workspaceRoot(exec) {
 	}
 }
 
-async function saveToWorkspace(cfg, exec, images) {
-	if (!cfg.saveToWorkspace) return {};
-	const root = workspaceRoot(exec) ?? process.cwd();
-	const dir = path.isAbsolute(cfg.workspaceFolder) ? cfg.workspaceFolder : path.join(root, cfg.workspaceFolder);
+/**
+ * 落盘：固定 outputDir 优先（配了就一定存），否则按 saveToWorkspace 存进会话工作区的
+ * workspaceFolder。都没有就只返回 ComfyUI 侧的产物，不写本地。
+ */
+async function saveOutputs(cfg, exec, images) {
+	const fixed = fixedOutputDir(cfg);
+	let dir = fixed;
+	if (!dir) {
+		if (!cfg.saveToWorkspace) return { savedTo: [], savedDir: '' };
+		const root = workspaceRoot(exec) ?? process.cwd();
+		dir = path.isAbsolute(cfg.workspaceFolder) ? cfg.workspaceFolder : path.join(root, cfg.workspaceFolder);
+	}
 	await mkdir(dir, { recursive: true });
 	const written = [];
 	for (const image of images) {
@@ -472,7 +654,61 @@ async function saveToWorkspace(cfg, exec, images) {
 		await writeFile(target, image.data);
 		written.push(target);
 	}
-	return { savedTo: written };
+	if (written.length > 0) ACTIVITY.lastSaveDir = dir;
+	return { savedTo: written, savedDir: dir };
+}
+
+/** 面板列图用的目录：固定 outputDir > 最近一次实际落盘目录。 */
+function outputListingDir(cfg) {
+	return fixedOutputDir(cfg) || ACTIVITY.lastSaveDir || '';
+}
+
+/** 工作流里这些 input key 的值是模型文件名，以及 ComfyUI 会去哪些子目录找它。 */
+const MODEL_DIRS = {
+	unet_name: ['unet', 'diffusion_models'],
+	clip_name: ['text_encoders', 'clip'],
+	vae_name: ['vae'],
+	lora_name: ['loras'],
+	model_name: ['ultralytics'],
+};
+
+/**
+ * 检查内置工作流要的模型文件在 modelsRoot 下有没有。纯本地检查（不联网），
+ * ComfyUI 在线时它的 /object_info 才是准的，这里只用来提前提示缺什么。
+ */
+async function modelRequirements(manifest, cfg) {
+	const root = modelsRoot(cfg);
+	const byId = new Map();
+	for (const entry of manifest.workflows) {
+		let wf;
+		try {
+			wf = await loadWorkflow(cfg, entry);
+		} catch {
+			continue;
+		}
+		for (const node of Object.values(wf)) {
+			const inputs = node?.inputs;
+			if (!inputs) continue;
+			for (const [key, value] of Object.entries(inputs)) {
+				const dirs = MODEL_DIRS[key];
+				if (!dirs || typeof value !== 'string' || value === '') continue;
+				const id = `${key}:${value}`;
+				const row = byId.get(id) ?? { key, name: value, dirs, workflows: [] };
+				if (!row.workflows.includes(entry.id)) row.workflows.push(entry.id);
+				byId.set(id, row);
+			}
+		}
+	}
+	const missing = [];
+	for (const row of byId.values()) {
+		if (!root) {
+			missing.push({ ...row, reason: '未配置 modelsRoot，无法检查' });
+			continue;
+		}
+		const candidates = row.dirs.map((dir) => path.join(root, dir, row.name));
+		if (!candidates.some((p) => existsSync(p))) missing.push({ ...row, lookedIn: candidates });
+	}
+	return { modelsRoot: root || undefined, checked: Boolean(root), missing };
 }
 
 /* ------------------------------------------------------------- 工具实现 */
@@ -507,9 +743,9 @@ function writeJson(res, status, body) {
 }
 
 async function recentImages(cfg) {
-	const dir = path.join(roots(cfg).output, 'draw');
+	const dir = outputListingDir(cfg);
+	if (!dir) return [];
 	try {
-		const { readdir, stat } = await import('node:fs/promises');
 		const names = await readdir(dir);
 		const rows = [];
 		for (const name of names) {
@@ -544,9 +780,18 @@ function familyDigest(manifest) {
 	return [...seen.values()];
 }
 
+/** 空闲关闭的实际开关与时长：idleShutdown 显式布尔优先，否则看 idleShutdownMs。 */
+function idleSettings(cfg) {
+	const flag = cfg.idleShutdown;
+	if (flag === false) return { enabled: false, idleMs: 0 };
+	const raw = Number(cfg.idleShutdownMs);
+	const configured = Number.isFinite(raw) && raw > 0;
+	if (flag === true) return { enabled: true, idleMs: configured ? raw : 900000 };
+	return { enabled: configured, idleMs: configured ? raw : 0 };
+}
+
 function idleSnapshot(cfg) {
-	const idleMs = Number(cfg.idleShutdownMs);
-	const enabled = Number.isFinite(idleMs) && idleMs > 0;
+	const { enabled, idleMs } = idleSettings(cfg);
 	const idleFor = Date.now() - ACTIVITY.last;
 	return {
 		enabled,
@@ -586,7 +831,7 @@ function registerPanelRoutes(ctx, cfg, log) {
 		handler: async (req, res) => {
 			if (req.method !== 'GET') return writeJson(res, 405, { ok: false, error: 'method-not-allowed' });
 			try {
-				const manifest = await loadManifest();
+				const manifest = await loadManifest(cfg);
 				const stats = await systemStats(cfg);
 				const device = stats?.devices?.[0];
 				return writeJson(res, 200, {
@@ -615,6 +860,24 @@ function registerPanelRoutes(ctx, cfg, log) {
 					families: familyDigest(manifest),
 					recent: await recentImages(cfg),
 					idle: idleSnapshot(cfg),
+					config: (() => {
+						const paths = spawnPaths(cfg);
+						const idle = idleSettings(cfg);
+						return {
+							baseUrl: cfg.comfyBaseUrl,
+							comfyRoot: paths.root || '',
+							comfyMain: paths.main || '',
+							comfyPython: paths.python || '',
+							autoStart: Boolean(cfg.autoStart),
+							modelsRoot: modelsRoot(cfg),
+							workflowsDir: expandPath(cfg.workflowsDir, paths.root),
+							outputDir: outputListingDir(cfg),
+							saveToWorkspace: Boolean(cfg.saveToWorkspace),
+							idleShutdown: idle.enabled,
+							idleShutdownMs: idle.idleMs,
+							idleShutdownScope: idleShutdownScope(cfg),
+						};
+					})(),
 				});
 			} catch (error) {
 				return writeJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
@@ -649,8 +912,9 @@ function registerPanelRoutes(ctx, cfg, log) {
 			}
 			if (!IMAGE_NAME.test(name)) return writeJson(res, 400, { ok: false, error: 'bad-name' });
 			try {
-				const { readFile: read } = await import('node:fs/promises');
-				const data = await read(path.join(roots(cfg).output, 'draw', name));
+				const dir = outputListingDir(cfg);
+				if (!dir) return writeJson(res, 404, { ok: false, error: 'no-output-dir' });
+				const data = await readFile(path.join(dir, name));
 				const ext = path.extname(name).toLowerCase();
 				const type = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
 					: ext === '.webp' ? 'image/webp'
@@ -680,7 +944,9 @@ function registerPanelRoutes(ctx, cfg, log) {
 				name = '';
 			}
 			if (!IMAGE_NAME.test(name)) return writeJson(res, 400, { ok: false, error: 'bad-name' });
-			const target = path.join(roots(cfg).output, 'draw', name);
+			const dir = outputListingDir(cfg);
+			if (!dir) return writeJson(res, 404, { ok: false, error: 'no-output-dir' });
+			const target = path.join(dir, name);
 			if (!existsSync(target)) return writeJson(res, 404, { ok: false, error: 'not-found' });
 			try {
 				openInFileManager(target);
@@ -713,8 +979,8 @@ export function apply(ctx, config) {
 	/* ------------------------------------------------------ 空闲自动关闭 */
 
 	ctx.effect(() => {
-		const idleMs = Number(cfg.idleShutdownMs);
-		if (!Number.isFinite(idleMs) || idleMs <= 0) return;
+		const { enabled, idleMs } = idleSettings(cfg);
+		if (!enabled || idleMs <= 0) return;
 		const pollMs = Math.max(5000, Math.min(120000, Number(cfg.idlePollMs) || 30000));
 		let stopping = false;
 
@@ -764,18 +1030,46 @@ export function apply(ctx, config) {
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
-			render: (_args, value) => [{
-				type: 'text',
-				text: value.running
+			render: (_args, value) => {
+				const c = value.config ?? {};
+				const lines = [value.running
 					? `ComfyUI 在线：${value.baseUrl}（${value.device ?? '未知设备'}，显存 ${value.vramFreeMb ?? '?'} / ${value.vramTotalMb ?? '?'} MB 空闲），已装 ${value.workflows} 个工作流。${value.started ? ' 本次由插件自动启动。' : ''}`
-					: `ComfyUI 不在线：${value.error ?? value.baseUrl}`,
-			}],
+					: `ComfyUI 不在线：${value.error ?? value.baseUrl}`];
+				lines.push(`配置：modelsRoot=${c.modelsRoot ?? '（未配置）'}；工作流目录=${c.workflowsDir ?? '（仅内置）'}；出图目录=${c.outputDir ?? (c.saveToWorkspace ? '会话工作区/draw-mode' : '（不保存）')}`);
+				lines.push(`无头启动：${c.autoStart ? '开启' : '关闭'}${c.comfyMain ? `，main.py=${c.comfyMain}` : ''}${c.comfyPython ? `，python=${c.comfyPython}` : ''}`);
+				lines.push(c.idleShutdown
+					? `空闲关闭：${Math.round((c.idleShutdownMs ?? 0) / 60000)} 分钟后关闭${c.idleShutdownScope === 'port' ? '（含端口上其他进程）' : '（仅本插件启动的进程）'}`
+					: '空闲关闭：关闭');
+				const missing = value.requirements?.missing ?? [];
+				if (missing.length > 0) {
+					lines.push(`\n缺 ${missing.length} 个模型文件（${value.requirements.checked ? '在 modelsRoot 下没找到' : 'modelsRoot 未配置'}）：`);
+					for (const m of missing) lines.push(`· ${m.key} ${m.name} ← ${m.workflows.join(', ')}`);
+				}
+				return [{ type: 'text', text: lines.join('\n') }];
+			},
 		},
 		timeoutMs: 300000,
 		isConcurrencySafe: () => false,
 		execute: async (args) => {
 			const url = cfg.comfyBaseUrl;
-			const manifest = await loadManifest();
+			const manifest = await loadManifest(cfg);
+			const paths = spawnPaths(cfg);
+			const idle = idleSettings(cfg);
+			const config = {
+				baseUrl: url,
+				comfyRoot: paths.root || undefined,
+				comfyMain: paths.main || undefined,
+				comfyPython: paths.python || undefined,
+				comfyWorkdir: paths.cwd || undefined,
+				autoStart: Boolean(cfg.autoStart),
+				modelsRoot: modelsRoot(cfg) || undefined,
+				workflowsDir: expandPath(cfg.workflowsDir, paths.root) || undefined,
+				outputDir: fixedOutputDir(cfg) || ACTIVITY.lastSaveDir || undefined,
+				saveToWorkspace: Boolean(cfg.saveToWorkspace),
+				idleShutdown: idle.enabled,
+				idleShutdownMs: idle.idleMs,
+				idleShutdownScope: idleShutdownScope(cfg),
+			};
 			let stats = await systemStats(cfg);
 			let started = false;
 			if (!stats && (args?.start ?? cfg.autoStart)) {
@@ -783,8 +1077,9 @@ export function apply(ctx, config) {
 				stats = ensured.stats;
 				started = ensured.started;
 			}
+			const requirements = await modelRequirements(manifest, cfg);
 			if (!stats) {
-				return { running: false, baseUrl: url, workflows: manifest.workflows.length, error: '连接失败，且未开启自动启动', logs };
+				return { running: false, baseUrl: url, workflows: manifest.workflows.length, config, requirements, error: '连接失败，且未开启自动启动', logs };
 			}
 			const device = stats.devices?.[0];
 			return {
@@ -795,6 +1090,8 @@ export function apply(ctx, config) {
 				vramTotalMb: device ? Math.round(device.vram_total / 1048576) : undefined,
 				vramFreeMb: device ? Math.round(device.vram_free / 1048576) : undefined,
 				workflows: manifest.workflows.length,
+				config,
+				requirements,
 				logs,
 			};
 		},
@@ -821,7 +1118,7 @@ export function apply(ctx, config) {
 		},
 		isConcurrencySafe: () => true,
 		execute: async (args) => {
-			const manifest = await loadManifest();
+			const manifest = await loadManifest(cfg);
 			const workflows = manifest.workflows
 				.filter((w) => !args?.task || w.task === args.task)
 				.map((w) => ({ id: w.id, label: w.label, family: w.family, task: w.task, defaults: w.defaults, notes: w.notes }));
@@ -933,12 +1230,12 @@ export function apply(ctx, config) {
 		isConcurrencySafe: () => false,
 		execute: async (args, exec) => {
 			const started = Date.now();
-			const manifest = await loadManifest();
+			const manifest = await loadManifest(cfg);
 			const entry = familyOf(manifest, String(args.workflow));
 			if (!entry) throw new Error(`没有这个工作流：${args.workflow}。可用：${manifest.workflows.map((w) => w.id).join(', ')}`);
 
 			await ensureComfy(cfg, log);
-			const workflow = await loadWorkflow(entry);
+			const workflow = await loadWorkflow(cfg, entry);
 
 			const defaults = entry.defaults ?? {};
 			const seed = resolveSeed(args.seed);
@@ -998,7 +1295,7 @@ export function apply(ctx, config) {
 				const attachment = await attachments.saveImage({ data: file.data, mediaType, name: file.filename });
 				images.push({ attachment, filename: file.filename });
 			}
-			const saved = await saveToWorkspace(cfg, exec, raw);
+			const saved = await saveOutputs(cfg, exec, raw);
 
 			return {
 				workflow: entry.id,
@@ -1013,7 +1310,7 @@ export function apply(ctx, config) {
 				...(args.lora ? { lora: String(args.lora) } : {}),
 				promptId,
 				elapsedMs: Date.now() - started,
-				...(saved.savedTo ? { savedTo: saved.savedTo } : {}),
+				...(saved.savedTo?.length ? { savedTo: saved.savedTo, savedDir: saved.savedDir } : {}),
 				logs,
 			};
 		},
@@ -1046,14 +1343,14 @@ export function apply(ctx, config) {
 		isConcurrencySafe: () => false,
 		execute: async (args, exec) => {
 			const started = Date.now();
-			const manifest = await loadManifest();
+			const manifest = await loadManifest(cfg);
 			const target = String(args.target);
 			const workflowId = target === 'anima' ? 'reverse-wd14' : 'reverse-joycaption';
 			const entry = familyOf(manifest, workflowId);
 			if (!entry) throw new Error(`工作流库里缺少 ${workflowId}`);
 
 			await ensureComfy(cfg, log);
-			const workflow = await loadWorkflow(entry);
+			const workflow = await loadWorkflow(cfg, entry);
 			const staged = await stageImage(ctx, exec, cfg, args.image);
 			workflow[entry.slots.image.node].inputs[entry.slots.image.input] = staged;
 			if (target === 'anima' && args.threshold !== undefined) setSlot(workflow, entry, 'threshold', args.threshold);
