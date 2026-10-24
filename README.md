@@ -179,7 +179,7 @@ All path values accept `~`, `%VAR%`, `${VAR}` and relative paths (resolved again
 
 所有路径都支持 `~`、`%VAR%`、`${VAR}` 和相对路径（按 `comfyRoot` 解析）。配置对不对不用猜——`draw_status` 会把解析结果回显出来：会 spawn 哪个 `main.py` / `python`、检查哪个 `modelsRoot`、出图存哪、以及还缺哪些模型文件。
 
-依赖见上面的英文清单，要点：ComfyUI 需 **v0.37.0 以上**（Qwen-Image 2.1 的文本编码节点是内置的）；工作流写死了具体文件名，换文件得改工作流 JSON 或把文件改名；自定义节点按族区分——Anima 的文生图只要原版 ComfyUI，Krea 2 / Qwen 需要 ComfyUI-GGUF，手脸修复要两个 Impact 包，两条反推分别要 WD14-Tagger / JoyCaption 加 MieNodes。
+依赖见上面的英文清单，要点：ComfyUI 需 **v0.37.0 以上**（Qwen-Image 2.1 的文本编码节点是内置的）；内置工作流按具体文件名找检查点，名字不同就用 `modelMap` 映射（不必改 JSON 或改文件名）；自定义节点按族区分——Anima 的文生图只要原版 ComfyUI，Krea 2 / Qwen 需要 ComfyUI-GGUF，手脸修复要两个 Impact 包，两条反推分别要 WD14-Tagger / JoyCaption 加 MieNodes。
 
 ## License
 
