@@ -8,7 +8,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -1199,7 +1199,10 @@ function registerPanelRoutes(ctx, cfg, baseCfg, ensureSettings, log) {
 			if (req.method !== 'POST') return writeJson(res, 405, { ok: false, error: 'method-not-allowed' });
 			return guarded(res, async () => {
 				const patch = await readJsonBody(req);
-				await writeSettings(cfg, patch ?? {});
+				/* reset：整份删掉，回到插件配置。布尔值没法用空串表达「不覆盖」，
+				   所以给面板一个明确的「清除覆盖」动作。 */
+				if (patch && patch.reset === true) await rm(settingsFile(cfg), { force: true });
+				else await writeSettings(cfg, patch ?? {});
 				/* 重新算一遍：设置文件里没有的键要回落到 patch 配置，不能留着上一次的值。 */
 				Object.assign(cfg, baseCfg, await readSettings(cfg));
 				log('配置已更新：' + settingsFile(cfg));

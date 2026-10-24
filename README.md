@@ -107,7 +107,9 @@ The sidebar entry **画图** opens a panel with:
 - the workflow directory, the discovered workflows (task, defaults, replaceable inputs) and any file that failed to parse;
 - thumbnails of recent output with a lightbox.
 
-Saving writes `~/.dsh/draw-mode/settings.json` and re-reads it immediately: **an empty field means "no override", so the value falls back to the plugin config**. That is how you revert a single setting without editing YAML.
+Saving writes `~/.dsh/draw-mode/settings.json` and re-reads it immediately: **an empty text field means "no override", so the value falls back to the plugin config**. That is how you revert a single setting without editing YAML.
+
+Checkboxes and numbers cannot be empty, so saving pins whatever the form shows for them. To get everything back to the plugin config in one go, use **清除覆盖** — it deletes the settings file outright.
 
 Precedence: built-in defaults < plugin config (`cordis.patch.yml`) < `settings.json` (the panel).
 
@@ -224,7 +226,7 @@ All path values accept `~`, `%VAR%`, `${VAR}` and relative paths (resolved again
 
 所有路径都支持 `~`、`%VAR%`、`${VAR}` 和相对路径（按 `comfyRoot` 解析）。
 
-面板保存时**留空表示「这一项不覆盖」**，会回落到插件配置里的值——想撤销某一项改动，把输入框清空保存即可。
+面板保存时**文本框留空表示「这一项不覆盖」**，会回落到插件配置里的值——想撤销某一项改动，把输入框清空保存即可。勾选框和数字框没法留空，保存就会把它们钉成当前显示的值；想把全部设置一次性还原成插件配置，点「清除覆盖」，它会直接删掉设置文件。
 
 优先级：内置默认 < 插件配置（`cordis.patch.yml`）< `settings.json`（面板）。
 

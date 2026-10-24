@@ -464,6 +464,25 @@ window.__ModuleLoader__.load({
           .finally(() => setSaving(false));
       };
 
+      // 布尔值没法用空串表达「不覆盖」，所以给一个整份清除的动作。
+      const reset = () => {
+        setSaving(true);
+        setNotice('');
+        fetch(`${API}/config`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ reset: true }),
+        })
+          .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
+          .then(() => {
+            setNotice('已清除设置文件，全部回落到插件配置');
+            setEditing(false);
+            load();
+          })
+          .catch((error) => setNotice(`清除失败：${error && error.message ? error.message : error}`))
+          .finally(() => setSaving(false));
+      };
+
       const test = () => {
         setTesting(true);
         setTested(null);
@@ -636,6 +655,15 @@ window.__ModuleLoader__.load({
               disabled: !state || !state.editable,
               onClick: editing ? closeEditor : openEditor,
             }, editing ? '取消' : '编辑'),
+            editing
+              ? null
+              : h('button', {
+                key: 'reset',
+                type: 'button',
+                className: 'dshdraw-btn',
+                disabled: saving || !state || !state.editable,
+                onClick: reset,
+              }, '清除覆盖'),
           ]),
 
           notice ? h('div', { key: 'notice', className: 'dshdraw-note' }, notice) : null,
