@@ -10,10 +10,13 @@
         timeoutMs: 900000
         saveToWorkspace: true
         workspaceFolder: 'draw-mode'
-        # 出图停下来以后空闲超过 15 分钟就自动关掉 ComfyUI，释放显存与内存。
-        # 改成 0 可以关闭这个行为；idlePollMs 是检查间隔。
-        idleShutdownMs: 900000
+        # 空闲自动关闭 ComfyUI（释放显存）。默认 0 = 关闭：不显式设置就不会替你结束任何进程。
+        # 想开启就填毫秒数，例如 900000 = 空闲 15 分钟后关闭；idlePollMs 是检查间隔。
+        idleShutdownMs: 0
         idlePollMs: 30000
+        # 空闲关闭的作用范围：'spawned' 只关本插件自己拉起的 ComfyUI（默认）；
+        # 'port' 会关掉 comfyBaseUrl 端口上的任何进程，包括你手动启动的那个。
+        idleShutdownScope: 'spawned'
 
     - id: preset-draw
       name: '@deepseek-ai/dsh-agent-preset'

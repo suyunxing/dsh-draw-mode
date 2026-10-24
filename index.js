@@ -25,10 +25,14 @@ const DEFAULTS = {
 	timeoutMs: 900000,
 	saveToWorkspace: true,
 	workspaceFolder: 'draw-mode',
-	/* 空闲自动关闭：出图停下来以后，超过这个时长没有任何新任务就杀掉 ComfyUI 释放显存。
-	   0 表示关闭该行为。 */
-	idleShutdownMs: 900000,
+	/* 空闲自动关闭：出图停下来以后，超过这个时长没有任何新任务就关掉 ComfyUI 释放显存。
+	   默认 0 = 不开启：不显式配置就不会替你结束任何进程。 */
+	idleShutdownMs: 0,
 	idlePollMs: 30000,
+	/* 空闲关闭的作用范围。'spawned'（默认）只结束本插件自己无头拉起的那个进程；
+	   'port' 会结束 comfyBaseUrl 端口上监听的任何进程——包括你手动启动的 ComfyUI
+	   和占用同一端口的其他服务，只在独占该端口时才用。 */
+	idleShutdownScope: 'spawned',
 };
 
 /** 最近一次绘图活动（工具调用 / 队列里有任务）。空闲判定只看这个时间戳。 */
@@ -179,13 +183,23 @@ function killTree(pid) {
 	});
 }
 
-/** 杀掉 ComfyUI（连同子进程），并等到端口不再响应。 */
+/** 空闲关闭的作用范围：默认只碰本插件自己拉起的进程。 */
+function idleShutdownScope(cfg) {
+	return cfg.idleShutdownScope === 'port' ? 'port' : 'spawned';
+}
+
+/** 关掉 ComfyUI（连同子进程），并等到端口不再响应。 */
 async function stopComfy(cfg, log) {
 	const port = new URL(cfg.comfyBaseUrl).port || '8188';
-	const pids = new Set(await listenerPids(port));
+	const scope = idleShutdownScope(cfg);
+	const pids = new Set();
+	/* 'port' 是破坏性的：端口上任何监听进程都会被算进来，包括不是本插件启动的。 */
+	if (scope === 'port') for (const pid of await listenerPids(port)) pids.add(pid);
 	if (LAST_SPAWN.pid) pids.add(LAST_SPAWN.pid);
 	if (pids.size === 0) {
-		log?.(`空闲关闭：${port} 端口上没有监听进程，无需处理`);
+		log?.(scope === 'port'
+			? `空闲关闭：${port} 端口上没有监听进程，无需处理`
+			: `空闲关闭：没有本插件启动的 ComfyUI 可关（${port} 端口上的其他进程不动）`);
 		ACTIVITY.lastStopPids = [];
 		return { stopped: false, pids: [] };
 	}
@@ -536,6 +550,7 @@ function idleSnapshot(cfg) {
 	const idleFor = Date.now() - ACTIVITY.last;
 	return {
 		enabled,
+		scope: idleShutdownScope(cfg),
 		idleMs: enabled ? idleMs : 0,
 		idleForMs: idleFor,
 		remainingMs: enabled ? Math.max(0, idleMs - idleFor) : 0,

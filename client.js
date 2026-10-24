@@ -404,7 +404,7 @@ window.__ModuleLoader__.load({
 
       const idle = state && state.idle;
       const idleHint = idle && idle.enabled
-        ? `空闲 ${Math.round(idle.idleMs / 60000)} 分钟后自动关闭${online ? `（剩 ${Math.max(0, Math.round(idle.remainingMs / 60000))} 分）` : ''}`
+        ? `空闲 ${Math.round(idle.idleMs / 60000)} 分钟后自动关闭${idle.scope === 'port' ? '（含端口上其他进程）' : '（仅本插件启动的进程）'}${online ? `（剩 ${Math.max(0, Math.round(idle.remainingMs / 60000))} 分）` : ''}`
         : '';
 
       const statusLine = stats
