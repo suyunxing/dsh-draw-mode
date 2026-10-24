@@ -716,7 +716,7 @@ window.__ModuleLoader__.load({
                 ]),
               ]),
               h('div', { key: 'file', className: 'dshdraw-hint dshdraw-fieldWide' },
-                `保存到 ${(state && state.settingsFile) || ''}；留空的项不覆盖插件配置。`),
+                `保存到 ${(state && state.settingsFile) || ''}；文本框留空 = 不覆盖插件配置，勾选框和数字会按当前值写入。`),
             ])
             : h('div', { key: 'summary', className: 'dshdraw-form' }, [
               summaryItem('ComfyUI', config ? config.baseUrl : ''),
