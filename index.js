@@ -1,8 +1,9 @@
 /**
  * @local/dsh-draw — 画图模式 Host 插件
  *
- * 把本地 ComfyUI 接进 DSH：工作流库路由、参数落位、LoRA 注入、无头启动、
- * 出图回传（内联附件）、按目标模型反推提示词。
+ * 把本地 ComfyUI 接进 DSH：工作流自动发现、参数落位、LoRA 注入、无头启动、
+ * 出图回传（内联附件）、图片反推。插件本身不带任何工作流与模型，是个空框架：
+ * 用户把自己从 ComfyUI 导出的 API 格式工作流放进 workflowsDir 即可。
  */
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -10,10 +11,9 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const WF_DIR = path.join(HERE, 'workflows');
+/* 面板里保存的配置写在这里；优先级：内置默认 < 插件 patch 里的 config < 这个文件。 */
+const DEFAULT_SETTINGS_PATH = path.join(homedir(), '.dsh', 'draw-mode', 'settings.json');
 
 const DEFAULTS = {
 	/* ---------------------------------------------------------- 连接 */
@@ -37,12 +37,16 @@ const DEFAULTS = {
 	/* 模型根目录，用于「离线检查工作流要的文件在不在」。留空则按 comfyRoot 推导
 	   <comfyRoot>/ComfyUI/models。ComfyUI 在线时以它的 /object_info 为准。 */
 	modelsRoot: '',
-	/* 额外的工作流目录（放自己的 manifest.json + 工作流 JSON），与内置库合并；
-	   同 id 覆盖内置。 */
+	/* 工作流目录：把 ComfyUI 里「Save (API Format)」导出的 JSON 丢进这里就行。
+	   插件不自带任何工作流，装好是空的。留空则按 comfyRoot 推导
+	   <comfyRoot>/ComfyUI/user/default/workflows。 */
 	workflowsDir: '',
-	/* 模型文件名映射：内置工作流写死的名字 → 你本机的名字。
-	   例如 { 'qwen_image_2.1_turbo_Q4_K_M.gguf': 'qwen_image_2.1_turbo_Q8_0.gguf' } */
+	/* 模型文件名映射：工作流里写的名字 → 你本机的名字。
+	   例如 { 'xxx_Q4_K_M.gguf': 'xxx_Q8_0.gguf' } */
 	modelMap: {},
+	/* 面板保存的配置文件路径。留空 = ~/.dsh/draw-mode/settings.json。
+	   这个键只从 patch 配置读，不能由设置文件自己改。 */
+	settingsPath: '',
 
 	/* ---------------------------------------------------------- 出图保存 */
 	/* 固定保存目录（绝对路径，支持 ~ 与 %VAR%）。设置后优先于 workspaceFolder。 */
@@ -321,30 +325,142 @@ async function stopComfy(cfg, log) {
 
 /* --------------------------------------------------------- 工作流库 */
 
-async function readManifestAt(dir) {
+/**
+ * 工作流库 = workflowsDir 下所有 *.json。插件本身不带任何工作流：装好是空的，
+ * 用户把 ComfyUI 里「Save (API Format)」导出的文件丢进去就行。
+ *
+ * 输入位置靠启发式检测（detectSlots），不要求用户改工作流。需要更精确的控制时，
+ * 可以在同目录放一个 sidecar：<文件名去 .json>.draw.json，形如
+ * { "label": "我的出图流", "task": "t2i", "slots": {...}, "defaults": {...}, "notes": "..." }
+ */
+
+const TEXT_CLASS = /textencode/i;
+
+function isLiteral(value) {
+	return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
+}
+
+function nodesWhere(wf, predicate) {
+	return Object.entries(wf).filter(([, node]) => node && typeof node === 'object' && predicate(node));
+}
+
+/** 从一份 ComfyUI API 格式工作流里猜出可替换的输入位置。 */
+function detectSlots(wf) {
+	const slots = {};
+
+	/* 正向 / 负向提示词：文本编码节点里写死的字符串 text。
+	   先看节点标题里的 pos/neg，没有就按节点 id 顺序取前两个。 */
+	const textNodes = nodesWhere(wf, (n) => TEXT_CLASS.test(String(n.class_type ?? '')) && typeof n.inputs?.text === 'string');
+	const byTitle = (re) => textNodes.find(([, n]) => re.test(String(n._meta?.title ?? '')))?.[0];
+	const positive = byTitle(/pos|正/i) ?? textNodes[0]?.[0];
+	const negative = byTitle(/neg|负/i) ?? textNodes.find(([id]) => id !== positive)?.[0];
+	if (positive) slots.prompt = { node: positive, input: 'text' };
+	if (negative) slots.negative = { node: negative, input: 'text' };
+
+	/* 采样参数：KSampler / KSamplerAdvanced / SamplerCustom。只认写死的字面量，
+	   连到别的节点的（link）不动，改了会断开连线。 */
+	const sampler = nodesWhere(wf, (n) => /ksampler|sampler/i.test(String(n.class_type ?? '')))[0];
+	if (sampler) {
+		const [id, node] = sampler;
+		const inputs = node.inputs ?? {};
+		for (const key of ['seed', 'noise_seed']) {
+			if (isLiteral(inputs[key])) {
+				slots.seed = { node: id, input: key };
+				break;
+			}
+		}
+		for (const key of ['steps', 'cfg', 'denoise']) {
+			if (isLiteral(inputs[key])) slots[key] = { node: id, input: key };
+		}
+	}
+
+	/* 画幅：同时有 width/height 字面量的节点（EmptyLatentImage 一类）。 */
+	const latent = nodesWhere(wf, (n) => isLiteral(n.inputs?.width) && isLiteral(n.inputs?.height))[0];
+	if (latent) {
+		slots.width = { node: latent[0], input: 'width' };
+		slots.height = { node: latent[0], input: 'height' };
+	}
+
+	/* 输入图：LoadImage 的 image。第一张是 image，第二张是 image2。 */
+	const loaders = nodesWhere(wf, (n) => /loadimage/i.test(String(n.class_type ?? '')) && isLiteral(n.inputs?.image));
+	if (loaders[0]) slots.image = { node: loaders[0][0], input: 'image' };
+	if (loaders[1]) slots.image2 = { node: loaders[1][0], input: 'image' };
+
+	/* LoRA：工作流里已经有 LoraLoader 就直接改它的 lora_name；
+	   没有的话 applyLora 会临时插一个。 */
+	const loraNode = nodesWhere(wf, (n) => /lora/i.test(String(n.class_type ?? '')) && isLiteral(n.inputs?.lora_name))[0];
+	if (loraNode) slots.lora = { node: loraNode[0], input: 'lora_name' };
+
+	return slots;
+}
+
+/** 工作流的默认参数 = 检测到的字面量值，让 draw_workflows 能报出来。 */
+function detectDefaults(wf, slots) {
+	const defaults = {};
+	const skip = new Set(['prompt', 'negative', 'image', 'image2', 'lora']);
+	for (const [name, slot] of Object.entries(slots)) {
+		if (skip.has(name)) continue;
+		const value = wf[slot.node]?.inputs?.[slot.input];
+		if (isLiteral(value)) defaults[name] = value;
+	}
+	return defaults;
+}
+
+function workflowIdOf(file) {
+	return file.replace(/\.json$/i, '').replace(/[^A-Za-z0-9._-]+/g, '-');
+}
+
+async function readSidecar(file) {
 	try {
-		const raw = await readFile(path.join(dir, 'manifest.json'), 'utf8');
-		const parsed = JSON.parse(raw);
-		return parsed && Array.isArray(parsed.workflows) ? parsed : null;
+		const parsed = JSON.parse(await readFile(file.replace(/\.json$/i, '.draw.json'), 'utf8'));
+		return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : undefined;
 	} catch {
-		return null;
+		return undefined;
 	}
 }
 
 /**
- * 工作流库 = 内置库 + workflowsDir（可选）。同 id 时用户目录覆盖内置，
- * 其余按 id 去重，内置顺序在前。每条都带上它所在目录，加载时按目录取文件。
+ * 扫 workflowsDir，逐个文件解析并检测输入位置。单个文件坏了不影响整库，
+ * 只在 errors 里记一条，面板和工具都会显示出来。
  */
-async function loadManifest(cfg) {
-	const merged = new Map();
-	const builtin = await readManifestAt(WF_DIR);
-	for (const wf of builtin?.workflows ?? []) merged.set(wf.id, { ...wf, __dir: WF_DIR });
-	const extraDir = expandPath(cfg?.workflowsDir, configRoot(cfg));
-	if (extraDir && path.resolve(extraDir) !== path.resolve(WF_DIR)) {
-		const extra = await readManifestAt(extraDir);
-		for (const wf of extra?.workflows ?? []) merged.set(wf.id, { ...wf, __dir: extraDir, __custom: true });
+async function discoverWorkflows(cfg) {
+	const dir = expandPath(cfg?.workflowsDir, configRoot(cfg));
+	const workflows = [];
+	const errors = [];
+	if (!dir) return { dir: '', workflows, errors };
+	let names;
+	try {
+		names = await readdir(dir);
+	} catch {
+		return { dir, workflows, errors: [{ file: dir, error: '目录不存在或不可读' }] };
 	}
-	return { version: builtin?.version, workflows: [...merged.values()] };
+	for (const name of names.filter((n) => n.toLowerCase().endsWith('.json') && !/\.draw\.json$/i.test(n)).sort()) {
+		const file = path.join(dir, name);
+		let wf;
+		try {
+			wf = JSON.parse(await readFile(file, 'utf8'));
+		} catch (error) {
+			errors.push({ file: name, error: 'JSON 解析失败：' + (error?.message ?? error) });
+			continue;
+		}
+		if (!wf || typeof wf !== 'object' || Array.isArray(wf)) {
+			errors.push({ file: name, error: '不是 ComfyUI API 格式（应是节点 id → 节点对象）' });
+			continue;
+		}
+		const sidecar = await readSidecar(file);
+		const detected = detectSlots(wf);
+		workflows.push({
+			id: workflowIdOf(name),
+			label: sidecar?.label ?? workflowIdOf(name),
+			task: sidecar?.task ?? (detected.image ? 'img2img' : 't2i'),
+			file: name,
+			dir,
+			slots: { ...detected, ...(sidecar?.slots ?? {}) },
+			defaults: { ...detectDefaults(wf, detected), ...(sidecar?.defaults ?? {}) },
+			notes: sidecar?.notes ?? '',
+		});
+	}
+	return { dir, workflows, errors };
 }
 
 /** 把工作流里写死的模型文件名换成用户本机的文件名（modelMap）。 */
@@ -364,23 +480,19 @@ function applyModelMap(wf, cfg) {
 }
 
 async function loadWorkflow(cfg, entry) {
-	const dir = entry.__dir ?? WF_DIR;
-	const raw = await readFile(path.join(dir, entry.file), 'utf8');
-	const wf = JSON.parse(raw);
+	const wf = JSON.parse(await readFile(path.join(entry.dir, entry.file), 'utf8'));
 	applyModelMap(wf, cfg);
 	return wf;
 }
 
 /* --------------------------------------------------- 参数落位 / LoRA */
 
-const LORA_NODE = '90';
-
 function setSlot(wf, entry, name, value) {
 	if (value === undefined || value === null) return false;
 	const slot = entry.slots?.[name];
 	if (!slot || Array.isArray(slot)) return false;
 	const node = wf[slot.node];
-	if (!node || !node.inputs) return false;
+	if (!node?.inputs) return false;
 	node.inputs[slot.input] = value;
 	return true;
 }
@@ -400,31 +512,60 @@ function dropNode(wf, nodeId) {
 	delete wf[id];
 }
 
+/**
+ * 注入 LoRA。工作流里已经有 LoraLoader 就改它的文件名与强度；没有就临时插一个，
+ * 接在「谁产出 model」和「谁消费 model」之间，并把原本直连 CLIP 的输入改接到 LoRA 的 CLIP 输出。
+ * 完全通用：不假设任何固定节点 id。
+ */
 function applyLora(wf, entry, name, strengthModel, strengthClip) {
-	const anchor = entry.slots?.lora_anchor;
-	const base = entry.slots?.lora_base;
-	if (!name || !anchor || !base) return false;
-	wf[LORA_NODE] = {
+	if (!name) return false;
+	const slot = entry.slots?.lora;
+	if (slot) {
+		const node = wf[slot.node];
+		if (!node?.inputs) return false;
+		node.inputs[slot.input] = name;
+		node.inputs.strength_model = strengthModel ?? 1;
+		node.inputs.strength_clip = strengthClip ?? 1;
+		return true;
+	}
+
+	const sampler = Object.entries(wf).find(([, n]) => /ksampler|sampler/i.test(String(n?.class_type ?? '')) && Array.isArray(n?.inputs?.model));
+	if (!sampler) return false;
+	const [samplerId, samplerNode] = sampler;
+
+	/* 找一条现成的 clip 连线：LoRA 节点必须接上它才有效。 */
+	let clipLink;
+	for (const [id, node] of Object.entries(wf)) {
+		if (id === samplerId) continue;
+		for (const [key, val] of Object.entries(node?.inputs ?? {})) {
+			if (key === 'clip' && Array.isArray(val)) {
+				clipLink = val;
+				break;
+			}
+		}
+		if (clipLink) break;
+	}
+	if (!clipLink) return false;
+
+	const id = 'dsh_lora';
+	wf[id] = {
 		class_type: 'LoraLoader',
 		inputs: {
-			model: base,
-			clip: ['2', 0],
+			model: samplerNode.inputs.model,
+			clip: clipLink,
 			lora_name: name,
 			strength_model: strengthModel ?? 1,
 			strength_clip: strengthClip ?? 1,
 		},
 	};
-	const node = wf[anchor.node];
-	if (!node?.inputs) return false;
-	node.inputs[anchor.input] = [LORA_NODE, 0];
-	// 把原本直连 CLIPLoader 的 clip 输入改接到 LoRA 的 CLIP 输出。
-	// 必须跳过 LoRA 节点自己，否则会写出自引用环。
-	for (const [id, candidate] of Object.entries(wf)) {
-		if (id === LORA_NODE || !candidate?.inputs) continue;
-		for (const [key, val] of Object.entries(candidate.inputs)) {
-			if (key === 'clip' && Array.isArray(val) && val[0] === '2') candidate.inputs[key] = [LORA_NODE, 1];
+	/* 原本直连那个 CLIP 的地方改接到 LoRA 的 CLIP 输出。必须跳过 LoRA 自己，否则自引用。 */
+	for (const [nodeId, node] of Object.entries(wf)) {
+		if (nodeId === id) continue;
+		for (const [key, val] of Object.entries(node?.inputs ?? {})) {
+			if (key === 'clip' && Array.isArray(val) && val[0] === clipLink[0] && val[1] === clipLink[1]) node.inputs[key] = [id, 1];
 		}
 	}
+	samplerNode.inputs.model = [id, 0];
 	return true;
 }
 
@@ -713,8 +854,195 @@ async function modelRequirements(manifest, cfg) {
 
 /* ------------------------------------------------------------- 工具实现 */
 
-function familyOf(manifest, workflowId) {
+function workflowOf(manifest, workflowId) {
 	return manifest.workflows.find((w) => w.id === workflowId);
+}
+
+/* ----------------------------------------------------------- 设置文件 */
+
+/* 可以由面板修改的键。settingsPath 不在里面：它决定文件在哪，不能由文件自己改。 */
+const SETTING_KEYS = [
+	'comfyBaseUrl', 'comfyRoot', 'comfyPython', 'comfyMain', 'comfyWorkdir', 'comfyArgs',
+	'autoStart', 'startTimeoutMs', 'timeoutMs',
+	'modelsRoot', 'workflowsDir', 'modelMap',
+	'outputDir', 'saveToWorkspace', 'workspaceFolder',
+	'idleShutdown', 'idleShutdownMs', 'idlePollMs', 'idleShutdownScope',
+];
+
+function settingsFile(cfg) {
+	return expandPath(cfg?.settingsPath, process.cwd()) || DEFAULT_SETTINGS_PATH;
+}
+
+function coerceSetting(key, value) {
+	switch (key) {
+		case 'autoStart':
+		case 'saveToWorkspace':
+			return Boolean(value);
+		case 'idleShutdown':
+			return value === undefined || value === null || value === '' ? undefined : Boolean(value);
+		case 'idleShutdownMs':
+		case 'idlePollMs':
+		case 'timeoutMs':
+		case 'startTimeoutMs': {
+			const num = Number(value);
+			return Number.isFinite(num) && num >= 0 ? num : undefined;
+		}
+		case 'comfyArgs':
+			if (Array.isArray(value)) return value.map(String);
+			return String(value ?? '').split(/\s+/).filter(Boolean);
+		case 'modelMap':
+			return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+		case 'idleShutdownScope':
+			return value === 'port' ? 'port' : 'spawned';
+		default:
+			return value === undefined || value === null ? '' : String(value);
+	}
+}
+
+async function readSettings(cfg) {
+	try {
+		const parsed = JSON.parse(await readFile(settingsFile(cfg), 'utf8'));
+		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+		const out = {};
+		for (const key of SETTING_KEYS) if (key in parsed) out[key] = coerceSetting(key, parsed[key]);
+		return out;
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * 把面板提交的字段合并进设置文件。空串表示「取消这条覆盖」，回落到 patch 配置。
+ * 只写已知键，未知键丢弃，避免把设置文件当成任意 JSON 存储。
+ */
+async function writeSettings(cfg, patch) {
+	const next = { ...(await readSettings(cfg)) };
+	for (const key of SETTING_KEYS) {
+		if (!(key in patch)) continue;
+		const value = coerceSetting(key, patch[key]);
+		const empty = value === undefined || value === '' || (key === 'modelMap' && Object.keys(value).length === 0);
+		if (empty) delete next[key];
+		else next[key] = value;
+	}
+	const file = settingsFile(cfg);
+	await mkdir(path.dirname(file), { recursive: true });
+	await writeFile(file, JSON.stringify(next, null, 2) + '\n', 'utf8');
+	return next;
+}
+
+/** 惰性加载一次设置文件（apply 是同步的，读文件只能异步）。 */
+function settingsLoader(cfg) {
+	let loaded;
+	return () => {
+		loaded ??= (async () => {
+			Object.assign(cfg, await readSettings(cfg));
+		})();
+		return loaded;
+	};
+}
+
+/* ----------------------------------------------------------- 配置视图 */
+
+/** 解析后的实际配置，给人看。 */
+function configView(cfg) {
+	const paths = spawnPaths(cfg);
+	const idle = idleSettings(cfg);
+	return {
+		baseUrl: cfg.comfyBaseUrl,
+		comfyRoot: paths.root || '',
+		comfyMain: paths.main || '',
+		comfyPython: paths.python || '',
+		comfyWorkdir: paths.cwd || '',
+		comfyArgs: Array.isArray(cfg.comfyArgs) ? cfg.comfyArgs : [],
+		autoStart: Boolean(cfg.autoStart),
+		modelsRoot: modelsRoot(cfg),
+		workflowsDir: expandPath(cfg.workflowsDir, configRoot(cfg)),
+		outputDir: outputListingDir(cfg),
+		saveToWorkspace: Boolean(cfg.saveToWorkspace),
+		workspaceFolder: cfg.workspaceFolder,
+		idleShutdown: idle.enabled,
+		idleShutdownMs: idle.idleMs,
+		idleShutdownScope: idleShutdownScope(cfg),
+		timeoutMs: cfg.timeoutMs,
+		startTimeoutMs: cfg.startTimeoutMs,
+		settingsFile: settingsFile(cfg),
+	};
+}
+
+/** 面板表单用的原始值：不展开 ~ 和变量，用户填的什么就显示什么。 */
+function editableConfig(cfg) {
+	const idle = idleSettings(cfg);
+	return {
+		comfyBaseUrl: cfg.comfyBaseUrl ?? '',
+		comfyRoot: cfg.comfyRoot ?? '',
+		comfyPython: cfg.comfyPython ?? '',
+		comfyMain: cfg.comfyMain ?? '',
+		comfyWorkdir: cfg.comfyWorkdir ?? '',
+		comfyArgs: Array.isArray(cfg.comfyArgs) ? cfg.comfyArgs.join(' ') : String(cfg.comfyArgs ?? ''),
+		autoStart: Boolean(cfg.autoStart),
+		modelsRoot: cfg.modelsRoot ?? '',
+		workflowsDir: cfg.workflowsDir ?? '',
+		outputDir: cfg.outputDir ?? '',
+		saveToWorkspace: Boolean(cfg.saveToWorkspace),
+		workspaceFolder: cfg.workspaceFolder ?? 'draw-mode',
+		idleShutdown: idle.enabled,
+		idleMinutes: Math.round((idle.idleMs || 0) / 60000),
+		idleShutdownScope: idleShutdownScope(cfg),
+		timeoutMs: cfg.timeoutMs,
+		startTimeoutMs: cfg.startTimeoutMs,
+	};
+}
+
+/* ----------------------------------------------------------- 模型清单 */
+
+/**
+ * 从 ComfyUI 的 /object_info 读它实际装了什么模型。不写死任何文件名：
+ * 用户装了什么就报什么，这是唯一可信的清单。
+ */
+async function installedModels(cfg) {
+	const base = cfg.comfyBaseUrl.replace(/\/+$/, '');
+	const res = await httpJson(base + '/object_info', { method: 'GET' }, 60000);
+	if (!res.ok) throw new Error('ComfyUI 返回 HTTP ' + res.status);
+	const info = res.body ?? {};
+	const pick = (nodeClass, key) => {
+		const spec = info?.[nodeClass]?.input?.required?.[key] ?? info?.[nodeClass]?.input?.optional?.[key];
+		const list = Array.isArray(spec?.[0]) ? spec[0] : undefined;
+		return Array.isArray(list) ? list.filter((v) => typeof v === 'string') : [];
+	};
+	const groups = [
+		{ id: 'checkpoints', label: '检查点', items: pick('CheckpointLoaderSimple', 'ckpt_name') },
+		{ id: 'diffusion', label: '扩散模型（unet）', items: [...new Set([...pick('UNETLoader', 'unet_name'), ...pick('UnetLoaderGGUF', 'unet_name')])] },
+		{ id: 'text_encoders', label: '文本编码器', items: [...new Set([...pick('CLIPLoader', 'clip_name'), ...pick('DualCLIPLoader', 'clip_name1')])] },
+		{ id: 'vae', label: 'VAE', items: pick('VAELoader', 'vae_name') },
+		{ id: 'loras', label: 'LoRA', items: pick('LoraLoader', 'lora_name') },
+	];
+	return { online: true, baseUrl: cfg.comfyBaseUrl, groups: groups.filter((g) => g.items.length > 0) };
+}
+
+function readJsonBody(req, limit = 1 << 20) {
+	return new Promise((resolve, reject) => {
+		let size = 0;
+		const chunks = [];
+		req.on('data', (chunk) => {
+			size += chunk.length;
+			if (size > limit) {
+				reject(new Error('请求体过大'));
+				req.destroy();
+				return;
+			}
+			chunks.push(chunk);
+		});
+		req.on('end', () => {
+			const text = Buffer.concat(chunks).toString('utf8').trim();
+			if (!text) return resolve({});
+			try {
+				resolve(JSON.parse(text));
+			} catch {
+				reject(new Error('请求体不是合法 JSON'));
+			}
+		});
+		req.on('error', reject);
+	});
 }
 
 function numberOr(value, fallback) {
@@ -763,23 +1091,6 @@ async function recentImages(cfg) {
 	}
 }
 
-function familyDigest(manifest) {
-	const seen = new Map();
-	for (const wf of manifest.workflows) {
-		if (seen.has(wf.family)) continue;
-		const d = wf.defaults ?? {};
-		seen.set(wf.family, {
-			id: wf.family,
-			width: d.width,
-			height: d.height,
-			steps: d.steps,
-			cfg: d.cfg,
-			workflows: manifest.workflows.filter((w) => w.family === wf.family).map((w) => w.id),
-		});
-	}
-	return [...seen.values()];
-}
-
 /** 空闲关闭的实际开关与时长：idleShutdown 显式布尔优先，否则看 idleShutdownMs。 */
 function idleSettings(cfg) {
 	const flag = cfg.idleShutdown;
@@ -819,22 +1130,30 @@ function openInFileManager(target) {
 	spawn('xdg-open', [path.dirname(target)], options).unref();
 }
 
-function registerPanelRoutes(ctx, cfg, log) {
+function registerPanelRoutes(ctx, cfg, baseCfg, ensureSettings, log) {
 	const server = ctx.get('webServer');
 	if (!server) return;
 
 	const disposers = [];
+	/* 所有 handler 统一兜异常：路由里抛错会让连接悬着，面板只看到转圈。 */
+	const guarded = (res, fn) => {
+		Promise.resolve()
+			.then(fn)
+			.catch((error) => writeJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) }));
+	};
 
+	/* 状态：面板首屏要的全部东西。 */
 	disposers.push(server.register({
 		kind: 'exact',
-		path: `${API_PREFIX}/state`,
+		path: API_PREFIX + '/state',
 		handler: async (req, res) => {
 			if (req.method !== 'GET') return writeJson(res, 405, { ok: false, error: 'method-not-allowed' });
-			try {
-				const manifest = await loadManifest(cfg);
+			return guarded(res, async () => {
+				await ensureSettings();
+				const manifest = await discoverWorkflows(cfg);
 				const stats = await systemStats(cfg);
 				const device = stats?.devices?.[0];
-				return writeJson(res, 200, {
+				writeJson(res, 200, {
 					ok: true,
 					online: stats !== null,
 					baseUrl: cfg.comfyBaseUrl,
@@ -849,59 +1168,89 @@ function registerPanelRoutes(ctx, cfg, log) {
 					workflows: manifest.workflows.map((w) => ({
 						id: w.id,
 						label: w.label,
-						family: w.family,
 						task: w.task,
-						width: w.defaults?.width,
-						height: w.defaults?.height,
-						steps: w.defaults?.steps,
-						cfg: w.defaults?.cfg,
+						defaults: w.defaults,
+						inputs: Object.keys(w.slots ?? {}),
 						notes: w.notes ?? '',
 					})),
-					families: familyDigest(manifest),
+					workflowErrors: manifest.errors,
+					workflowsDir: manifest.dir,
 					recent: await recentImages(cfg),
 					idle: idleSnapshot(cfg),
-					config: (() => {
-						const paths = spawnPaths(cfg);
-						const idle = idleSettings(cfg);
-						return {
-							baseUrl: cfg.comfyBaseUrl,
-							comfyRoot: paths.root || '',
-							comfyMain: paths.main || '',
-							comfyPython: paths.python || '',
-							autoStart: Boolean(cfg.autoStart),
-							modelsRoot: modelsRoot(cfg),
-							workflowsDir: expandPath(cfg.workflowsDir, paths.root),
-							outputDir: outputListingDir(cfg),
-							saveToWorkspace: Boolean(cfg.saveToWorkspace),
-							idleShutdown: idle.enabled,
-							idleShutdownMs: idle.idleMs,
-							idleShutdownScope: idleShutdownScope(cfg),
-						};
-					})(),
+					config: configView(cfg),
+					editable: editableConfig(cfg),
+					settingsFile: settingsFile(cfg),
 				});
-			} catch (error) {
-				return writeJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
-			}
+			});
 		},
 	}));
 
+	/* 配置：GET 读当前值（表单用），POST 保存并立刻生效。 */
 	disposers.push(server.register({
 		kind: 'exact',
-		path: `${API_PREFIX}/start`,
+		path: API_PREFIX + '/config',
+		handler: async (req, res) => {
+			if (req.method === 'GET') {
+				return guarded(res, async () => {
+					await ensureSettings();
+					writeJson(res, 200, { ok: true, editable: editableConfig(cfg), config: configView(cfg), settingsFile: settingsFile(cfg) });
+				});
+			}
+			if (req.method !== 'POST') return writeJson(res, 405, { ok: false, error: 'method-not-allowed' });
+			return guarded(res, async () => {
+				const patch = await readJsonBody(req);
+				await writeSettings(cfg, patch ?? {});
+				/* 重新算一遍：设置文件里没有的键要回落到 patch 配置，不能留着上一次的值。 */
+				Object.assign(cfg, baseCfg, await readSettings(cfg));
+				log('配置已更新：' + settingsFile(cfg));
+				writeJson(res, 200, { ok: true, editable: editableConfig(cfg), config: configView(cfg), settingsFile: settingsFile(cfg) });
+			});
+		},
+	}));
+
+	/* 连通性测试：不落盘，只回报当前配置能不能连上 ComfyUI。 */
+	disposers.push(server.register({
+		kind: 'exact',
+		path: API_PREFIX + '/test',
 		handler: async (req, res) => {
 			if (req.method !== 'POST') return writeJson(res, 405, { ok: false, error: 'method-not-allowed' });
-			try {
-				const result = await ensureComfy(cfg, log ?? (() => {}));
-				return writeJson(res, 200, { ok: true, started: result.started });
-			} catch (error) {
-				return writeJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
-			}
+			return guarded(res, async () => {
+				await ensureSettings();
+				const manifest = await discoverWorkflows(cfg);
+				const stats = await systemStats(cfg);
+				const device = stats?.devices?.[0];
+				writeJson(res, 200, {
+					ok: true,
+					online: stats !== null,
+					baseUrl: cfg.comfyBaseUrl,
+					device: device?.name ?? null,
+					vramFreeMb: device ? Math.round((device.vram_free ?? 0) / 1048576) : null,
+					workflowsDir: manifest.dir,
+					workflows: manifest.workflows.length,
+					workflowErrors: manifest.errors,
+					settingsFile: settingsFile(cfg),
+					error: stats === null ? '连不上 ' + cfg.comfyBaseUrl : undefined,
+				});
+			});
 		},
 	}));
 
 	disposers.push(server.register({
 		kind: 'exact',
-		path: `${API_PREFIX}/image`,
+		path: API_PREFIX + '/start',
+		handler: async (req, res) => {
+			if (req.method !== 'POST') return writeJson(res, 405, { ok: false, error: 'method-not-allowed' });
+			return guarded(res, async () => {
+				await ensureSettings();
+				const result = await ensureComfy(cfg, log ?? (() => {}));
+				writeJson(res, 200, { ok: true, started: result.started });
+			});
+		},
+	}));
+
+	disposers.push(server.register({
+		kind: 'exact',
+		path: API_PREFIX + '/image',
 		handler: async (req, res) => {
 			if (req.method !== 'GET') return writeJson(res, 405, { ok: false, error: 'method-not-allowed' });
 			let name;
@@ -911,7 +1260,8 @@ function registerPanelRoutes(ctx, cfg, log) {
 				name = '';
 			}
 			if (!IMAGE_NAME.test(name)) return writeJson(res, 400, { ok: false, error: 'bad-name' });
-			try {
+			return guarded(res, async () => {
+				await ensureSettings();
 				const dir = outputListingDir(cfg);
 				if (!dir) return writeJson(res, 404, { ok: false, error: 'no-output-dir' });
 				const data = await readFile(path.join(dir, name));
@@ -926,15 +1276,13 @@ function registerPanelRoutes(ctx, cfg, log) {
 					'content-length': data.length,
 				});
 				res.end(data);
-			} catch {
-				return writeJson(res, 404, { ok: false, error: 'not-found' });
-			}
+			});
 		},
 	}));
 
 	disposers.push(server.register({
 		kind: 'exact',
-		path: `${API_PREFIX}/reveal`,
+		path: API_PREFIX + '/reveal',
 		handler: async (req, res) => {
 			if (req.method !== 'POST') return writeJson(res, 405, { ok: false, error: 'method-not-allowed' });
 			let name = '';
@@ -944,16 +1292,15 @@ function registerPanelRoutes(ctx, cfg, log) {
 				name = '';
 			}
 			if (!IMAGE_NAME.test(name)) return writeJson(res, 400, { ok: false, error: 'bad-name' });
-			const dir = outputListingDir(cfg);
-			if (!dir) return writeJson(res, 404, { ok: false, error: 'no-output-dir' });
-			const target = path.join(dir, name);
-			if (!existsSync(target)) return writeJson(res, 404, { ok: false, error: 'not-found' });
-			try {
+			return guarded(res, async () => {
+				await ensureSettings();
+				const dir = outputListingDir(cfg);
+				if (!dir) return writeJson(res, 404, { ok: false, error: 'no-output-dir' });
+				const target = path.join(dir, name);
+				if (!existsSync(target)) return writeJson(res, 404, { ok: false, error: 'not-found' });
 				openInFileManager(target);
-				return writeJson(res, 200, { ok: true, path: target });
-			} catch (error) {
-				return writeJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
-			}
+				writeJson(res, 200, { ok: true, path: target });
+			});
 		},
 	}));
 
@@ -963,29 +1310,35 @@ function registerPanelRoutes(ctx, cfg, log) {
 export const inject = ['tools'];
 
 export function apply(ctx, config) {
-	const cfg = { ...DEFAULTS, ...(config ?? {}) };
+	/* cfg 可变：面板保存后直接 Object.assign，工具下次调用就读到新值。
+	   baseCfg 是 patch 配置的快照，面板清空某项时回落到这里。 */
+	const baseCfg = { ...DEFAULTS, ...(config ?? {}) };
+	const cfg = { ...baseCfg };
+	const ensureSettings = settingsLoader(cfg);
 	const logs = [];
 
-	const log = (line) => logs.push(`[${new Date().toISOString()}] ${line}`);
+	const log = (line) => logs.push('[' + new Date().toISOString() + '] ' + line);
 
 	/* 面板路由挂在 web app 的 webServer 上，headless 部署根本不组装它。
 	   必须用 ctx.inject 跟随服务：apply 时直接 ctx.get('webServer') 只是「读一次」，
 	   webServer 还没起来就拿到 undefined，registerPanelRoutes 静默 return，
 	   一条路由都没注册，面板取 /draw-mode/api/state 落到静态兜底 → 接口异常：HTTP 404。 */
 	ctx.inject(['webServer'], (webCtx) => {
-		webCtx.effect(() => registerPanelRoutes(webCtx, cfg, log));
+		webCtx.effect(() => registerPanelRoutes(webCtx, cfg, baseCfg, ensureSettings, log));
 	});
 
 	/* ------------------------------------------------------ 空闲自动关闭 */
 
 	ctx.effect(() => {
-		const { enabled, idleMs } = idleSettings(cfg);
-		if (!enabled || idleMs <= 0) return;
 		const pollMs = Math.max(5000, Math.min(120000, Number(cfg.idlePollMs) || 30000));
 		let stopping = false;
 
 		const tick = async () => {
 			if (stopping) return;
+			/* 每轮都重读设置：面板里改了开关或时长要立刻生效，不用重启。 */
+			await ensureSettings();
+			const { enabled, idleMs } = idleSettings(cfg);
+			if (!enabled || idleMs <= 0) return;
 			if (!(await comfyUp(cfg))) {
 				/* 没在跑就不用管，把计时推到现在，避免下次启动后立刻误杀 */
 				ACTIVITY.last = Date.now();
@@ -1000,7 +1353,7 @@ export function apply(ctx, config) {
 			if (idleFor < idleMs) return;
 			stopping = true;
 			try {
-				log(`空闲 ${Math.round(idleFor / 60000)} 分钟（阈值 ${Math.round(idleMs / 60000)} 分钟），关闭 ComfyUI 释放显存与内存`);
+				log('空闲 ' + Math.round(idleFor / 60000) + ' 分钟（阈值 ' + Math.round(idleMs / 60000) + ' 分钟），关闭 ComfyUI 释放显存与内存');
 				await stopComfy(cfg, log);
 				ACTIVITY.lastShutdownAt = Date.now();
 			} finally {
@@ -1010,7 +1363,7 @@ export function apply(ctx, config) {
 		};
 
 		const timer = setInterval(() => {
-			tick().catch((error) => log(`空闲关闭检查失败：${error?.message ?? error}`));
+			tick().catch((error) => log('空闲关闭检查失败：' + (error?.message ?? error)));
 		}, pollMs);
 		timer.unref?.();
 		return () => clearInterval(timer);
@@ -1018,9 +1371,11 @@ export function apply(ctx, config) {
 
 	/* ---------------------------------------------------------- draw_status */
 
+	/* ---------------------------------------------------------- draw_status */
+
 	ctx.effect(() => ctx.tools.register({
 		name: 'draw_status',
-		description: 'Check whether the local ComfyUI server is reachable, and start it headlessly when it is not. Use this first in a drawing session, or when a draw_* call reports a connection error. Returns GPU/VRAM info and how many workflows are installed.',
+		description: 'Check whether the local ComfyUI server is reachable, and start it headlessly when it is not. Use this first in a drawing session, or when a draw_* call reports a connection error. Returns GPU/VRAM info, the resolved configuration, and how many workflows were found in workflowsDir.',
 		parameters: {
 			type: 'object',
 			properties: {
@@ -1032,18 +1387,30 @@ export function apply(ctx, config) {
 			schema: { type: 'object', additionalProperties: true },
 			render: (_args, value) => {
 				const c = value.config ?? {};
-				const lines = [value.running
-					? `ComfyUI 在线：${value.baseUrl}（${value.device ?? '未知设备'}，显存 ${value.vramFreeMb ?? '?'} / ${value.vramTotalMb ?? '?'} MB 空闲），已装 ${value.workflows} 个工作流。${value.started ? ' 本次由插件自动启动。' : ''}`
-					: `ComfyUI 不在线：${value.error ?? value.baseUrl}`];
-				lines.push(`配置：modelsRoot=${c.modelsRoot ?? '（未配置）'}；工作流目录=${c.workflowsDir ?? '（仅内置）'}；出图目录=${c.outputDir ?? (c.saveToWorkspace ? '会话工作区/draw-mode' : '（不保存）')}`);
-				lines.push(`无头启动：${c.autoStart ? '开启' : '关闭'}${c.comfyMain ? `，main.py=${c.comfyMain}` : ''}${c.comfyPython ? `，python=${c.comfyPython}` : ''}`);
+				const head = value.running
+					? 'ComfyUI 在线：' + value.baseUrl + '（' + (value.device ?? '未知设备') + '，显存 ' + (value.vramFreeMb ?? '?') + ' / ' + (value.vramTotalMb ?? '?') + ' MB 空闲），工作流目录里有 ' + value.workflows + ' 个。' + (value.started ? ' 本次由插件自动启动。' : '')
+					: 'ComfyUI 不在线：' + (value.error ?? value.baseUrl);
+				const lines = [head];
+				lines.push('配置：工作流目录=' + (c.workflowsDir || '（未配置）') + '；出图目录=' + (c.outputDir || (c.saveToWorkspace ? '会话工作区/' + c.workspaceFolder : '（不保存）')) + '；模型目录=' + (c.modelsRoot || '（未配置）'));
+				lines.push('无头启动：' + (c.autoStart ? '开启' : '关闭') + (c.comfyMain ? '，main.py=' + c.comfyMain : '') + (c.comfyPython ? '，python=' + c.comfyPython : ''));
 				lines.push(c.idleShutdown
-					? `空闲关闭：${Math.round((c.idleShutdownMs ?? 0) / 60000)} 分钟后关闭${c.idleShutdownScope === 'port' ? '（含端口上其他进程）' : '（仅本插件启动的进程）'}`
+					? '空闲关闭：' + Math.round((c.idleShutdownMs ?? 0) / 60000) + ' 分钟后关闭' + (c.idleShutdownScope === 'port' ? '（含端口上其他进程）' : '（仅本插件启动的进程）')
 					: '空闲关闭：关闭');
+				lines.push('设置文件：' + c.settingsFile + '（侧栏面板可直接改）');
+				if (!value.workflows) {
+					lines.push('工作流目录是空的：把 ComfyUI 里「Save (API Format)」导出的 JSON 放进去，或用侧栏面板改路径。');
+				}
+				const errors = value.workflowErrors ?? [];
+				if (errors.length > 0) {
+					lines.push('');
+					lines.push('有 ' + errors.length + ' 个文件读不了：');
+					for (const e of errors) lines.push('· ' + e.file + ' — ' + e.error);
+				}
 				const missing = value.requirements?.missing ?? [];
 				if (missing.length > 0) {
-					lines.push(`\n缺 ${missing.length} 个模型文件（${value.requirements.checked ? '在 modelsRoot 下没找到' : 'modelsRoot 未配置'}）：`);
-					for (const m of missing) lines.push(`· ${m.key} ${m.name} ← ${m.workflows.join(', ')}`);
+					lines.push('');
+					lines.push('缺 ' + missing.length + ' 个模型文件（' + (value.requirements.checked ? '在 modelsRoot 下没找到' : 'modelsRoot 未配置') + '）：');
+					for (const m of missing) lines.push('· ' + m.key + ' ' + m.name + ' ← ' + m.workflows.join(', '));
 				}
 				return [{ type: 'text', text: lines.join('\n') }];
 			},
@@ -1051,25 +1418,8 @@ export function apply(ctx, config) {
 		timeoutMs: 300000,
 		isConcurrencySafe: () => false,
 		execute: async (args) => {
-			const url = cfg.comfyBaseUrl;
-			const manifest = await loadManifest(cfg);
-			const paths = spawnPaths(cfg);
-			const idle = idleSettings(cfg);
-			const config = {
-				baseUrl: url,
-				comfyRoot: paths.root || undefined,
-				comfyMain: paths.main || undefined,
-				comfyPython: paths.python || undefined,
-				comfyWorkdir: paths.cwd || undefined,
-				autoStart: Boolean(cfg.autoStart),
-				modelsRoot: modelsRoot(cfg) || undefined,
-				workflowsDir: expandPath(cfg.workflowsDir, paths.root) || undefined,
-				outputDir: fixedOutputDir(cfg) || ACTIVITY.lastSaveDir || undefined,
-				saveToWorkspace: Boolean(cfg.saveToWorkspace),
-				idleShutdown: idle.enabled,
-				idleShutdownMs: idle.idleMs,
-				idleShutdownScope: idleShutdownScope(cfg),
-			};
+			await ensureSettings();
+			const manifest = await discoverWorkflows(cfg);
 			let stats = await systemStats(cfg);
 			let started = false;
 			if (!stats && (args?.start ?? cfg.autoStart)) {
@@ -1078,18 +1428,29 @@ export function apply(ctx, config) {
 				started = ensured.started;
 			}
 			const requirements = await modelRequirements(manifest, cfg);
+			const config = configView(cfg);
 			if (!stats) {
-				return { running: false, baseUrl: url, workflows: manifest.workflows.length, config, requirements, error: '连接失败，且未开启自动启动', logs };
+				return {
+					running: false,
+					baseUrl: cfg.comfyBaseUrl,
+					workflows: manifest.workflows.length,
+					workflowErrors: manifest.errors,
+					config,
+					requirements,
+					error: '连接失败，且未开启自动启动',
+					logs,
+				};
 			}
 			const device = stats.devices?.[0];
 			return {
 				running: true,
-				baseUrl: url,
+				baseUrl: cfg.comfyBaseUrl,
 				started,
 				device: device?.name,
 				vramTotalMb: device ? Math.round(device.vram_total / 1048576) : undefined,
 				vramFreeMb: device ? Math.round(device.vram_free / 1048576) : undefined,
 				workflows: manifest.workflows.length,
+				workflowErrors: manifest.errors,
 				config,
 				requirements,
 				logs,
@@ -1101,7 +1462,7 @@ export function apply(ctx, config) {
 
 	ctx.effect(() => ctx.tools.register({
 		name: 'draw_workflows',
-		description: 'List the installed drawing workflows (id, model family, task type, default parameters, optional workflow notes) so a matching workflow can be chosen before calling draw_generate. Optionally filter by task.',
+		description: 'List the workflows found in the configured workflowsDir (id, label, task, default parameters, which inputs are replaceable) so a matching one can be chosen before draw_generate or draw_reverse. Workflows are whatever ComfyUI API-format JSON files the user put there; the plugin bundles none.',
 		parameters: {
 			type: 'object',
 			properties: {
@@ -1111,18 +1472,40 @@ export function apply(ctx, config) {
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
-			render: (_args, value) => [{
-				type: 'text',
-				text: value.workflows.map((w) => `${w.id} — ${w.label}［${w.task}］${w.notes ? ' · ' + w.notes : ''}`).join('\n'),
-			}],
+			render: (_args, value) => {
+				if (value.workflows.length === 0) {
+					const text = value.dir
+						? '工作流目录里没有可用的 JSON：' + value.dir + '\n把 ComfyUI 里「Save (API Format)」导出的工作流放进这个目录，或用侧栏面板改路径。'
+						: '还没配置工作流目录（workflowsDir）。用侧栏面板填上，或在插件配置里设置。';
+					return [{ type: 'text', text }];
+				}
+				const lines = value.workflows.map((w) => {
+					const params = Object.entries(w.defaults ?? {}).map(([k, v]) => k + '=' + v).join(' ');
+					const inputs = w.inputs?.length ? '；可传：' + w.inputs.join(', ') : '';
+					return w.id + ' — ' + w.label + '［' + w.task + '］' + (params ? ' · ' + params : '') + inputs + (w.notes ? ' · ' + w.notes : '');
+				});
+				if (value.errors?.length) {
+					lines.push('');
+					lines.push('读不了的文件：' + value.errors.map((e) => e.file + '（' + e.error + '）').join('；'));
+				}
+				return [{ type: 'text', text: lines.join('\n') }];
+			},
 		},
 		isConcurrencySafe: () => true,
 		execute: async (args) => {
-			const manifest = await loadManifest(cfg);
+			await ensureSettings();
+			const manifest = await discoverWorkflows(cfg);
 			const workflows = manifest.workflows
 				.filter((w) => !args?.task || w.task === args.task)
-				.map((w) => ({ id: w.id, label: w.label, family: w.family, task: w.task, defaults: w.defaults, notes: w.notes }));
-			return { workflows };
+				.map((w) => ({
+					id: w.id,
+					label: w.label,
+					task: w.task,
+					defaults: w.defaults,
+					inputs: Object.keys(w.slots ?? {}),
+					notes: w.notes,
+				}));
+			return { dir: manifest.dir, workflows, errors: manifest.errors };
 		},
 	}));
 
@@ -1130,58 +1513,31 @@ export function apply(ctx, config) {
 
 	ctx.effect(() => ctx.tools.register({
 		name: 'draw_models',
-		description: 'Describe the three drawing model families available locally: which checkpoint, text encoder and VAE each uses, its default resolution/steps/cfg/sampler, and the prompt dialect it expects. Optionally include the LoRA files installed for that family.',
-		parameters: {
-			type: 'object',
-			properties: {
-				includeLoras: { type: 'boolean', description: 'Also return installed LoRA file names usable with draw_generate.' },
-			},
-			additionalProperties: false,
-		},
+		description: 'List the model files the running ComfyUI actually has installed (checkpoints, diffusion models, text encoders, VAEs, LoRAs), read from its /object_info. Use it to pick a real file name for a workflow input or for the lora argument of draw_generate. Nothing is hard-coded: whatever ComfyUI reports is what you get.',
+		parameters: { type: 'object', properties: {}, additionalProperties: false },
 		output: {
 			schema: { type: 'object', additionalProperties: true },
 			render: (_args, value) => {
-				const lines = value.families.map((f) => `${f.id} — ${f.label}：${f.unet}，${f.width}x${f.height}，${f.steps} 步，cfg ${f.cfg}，${f.sampler}；提示词写法：${f.promptStyle}`);
-				if (value.loras?.length) lines.push(`\n可用 LoRA（${value.loras.length} 个，draw_generate 的 lora 参数取这里的完整文件名）：\n` + value.loras.map((l) => '· ' + l).join('\n'));
+				if (!value.online) return [{ type: 'text', text: 'ComfyUI 不在线，读不到模型清单：' + (value.error ?? value.baseUrl) }];
+				if (!value.groups?.length) return [{ type: 'text', text: 'ComfyUI 在线，但没有装任何模型文件。' }];
+				const lines = ['ComfyUI 里的模型（' + value.baseUrl + '）：'];
+				for (const g of value.groups) {
+					lines.push('');
+					lines.push(g.label + '（' + g.items.length + '）');
+					for (const item of g.items) lines.push('· ' + item);
+				}
 				return [{ type: 'text', text: lines.join('\n') }];
 			},
 		},
+		timeoutMs: 120000,
 		isConcurrencySafe: () => true,
-		execute: async (args) => {
-			const families = [
-				{
-					id: 'anima', label: 'Anima SilvermoonMix（2.9B 动漫）',
-					unet: 'SilvermoonMix-Anima29B-Evolved-V2.3-INT8-ConvRot.safetensors',
-					clip: 'qwen_3_06b_base.safetensors (stable_diffusion)', vae: 'qwen_image_vae.safetensors',
-					width: 832, height: 1216, steps: 30, cfg: 4, sampler: 'er_sde / simple',
-					promptStyle: 'Danbooru 标签串，逗号分隔，质量前缀 masterpiece/best quality/very aesthetic/score_7/safe，必须配负面词',
-				},
-				{
-					id: 'krea2', label: 'Krea2（写实/风格化）',
-					unet: 'Krea-2-Turbo-Q4_K_M.gguf',
-					clip: 'qwen3-vl-4b-heretic_fp8_e4m3fn.safetensors (krea2)', vae: 'qwen_image_vae.safetensors',
-					width: 768, height: 1280, steps: 8, cfg: 1, sampler: 'euler / simple',
-					promptStyle: '自然语言长句，描述主体+环境+光线+镜头，不用标签堆砌，负面词留空',
-				},
-				{
-					id: 'qwen21', label: 'Qwen-Image 2.1（通用/改图）',
-					unet: 'qwen_image_2.1_turbo_Q4_K_M.gguf',
-					clip: 'qwen3vl_8b_w4a8_heretic.safetensors (qwen_image)', vae: 'qwen_image_2.1_vae_bf16.safetensors',
-					width: 1024, height: 1024, steps: 8, cfg: 1, sampler: 'euler / simple',
-					promptStyle: '自然语言（中英文皆可），改图时写成明确的编辑指令，说明改什么、不动什么',
-				},
-			];
-			let loras;
-			if (args?.includeLoras) {
-				try {
-					const res = await httpJson(cfg.comfyBaseUrl.replace(/\/+$/, '') + '/object_info/LoraLoader', { method: 'GET' }, 30000);
-					const names = res.body?.LoraLoader?.input?.required?.lora_name?.[0];
-					if (Array.isArray(names)) loras = names;
-				} catch {
-					loras = undefined;
-				}
+		execute: async () => {
+			await ensureSettings();
+			try {
+				return await installedModels(cfg);
+			} catch (error) {
+				return { online: false, baseUrl: cfg.comfyBaseUrl, groups: [], error: error?.message ?? String(error) };
 			}
-			return { families, ...(loras ? { loras } : {}) };
 		},
 	}));
 
@@ -1189,23 +1545,23 @@ export function apply(ctx, config) {
 
 	ctx.effect(() => ctx.tools.register({
 		name: 'draw_generate',
-		description: 'Generate or edit an image through the local ComfyUI workflow library. Pick a workflow id from draw_workflows, then pass the finished prompt in that model family\'s dialect. Image-to-image and edit workflows read the newest image in the conversation by default; pass image with a local file path or an attachment sha256 to override. The generated image is attached to the conversation and returned inline.',
+		description: 'Generate or edit an image by running one of the workflows in workflowsDir through the local ComfyUI. Pick a workflow id from draw_workflows; the inputs that workflow exposes (prompt, negative, width, height, steps, cfg, seed, denoise, lora, image) are filled in, everything else stays as saved in the workflow. Image inputs default to the newest image in the conversation. The generated image is attached to the conversation and returned inline.',
 		parameters: {
 			type: 'object',
 			properties: {
-				workflow: { type: 'string', description: 'Workflow id from draw_workflows, for example anima-t2i, krea2-t2i, qwen21-t2i, anima-img2img, qwen21-edit, anima-t2i-handfix.' },
-				prompt: { type: 'string', description: 'The finished prompt, already written in the target model family prompt dialect.' },
-				negative: { type: 'string', description: 'Negative prompt. Only meaningful for the anima family; others leave it empty.' },
-				width: { type: 'integer', description: 'Output width in pixels. Defaults to the workflow default.' },
-				height: { type: 'integer', description: 'Output height in pixels. Defaults to the workflow default.' },
-				steps: { type: 'integer', description: 'Sampling steps. Defaults to the workflow default.' },
-				cfg: { type: 'number', description: 'CFG scale. Keep 1.0 for the turbo models unless asked otherwise.' },
-				seed: { type: 'integer', description: 'Seed. Omit or pass -1 for a random seed; the used seed is reported back.' },
-				denoise: { type: 'number', description: 'Denoise strength for image-to-image workflows; ignored by text-to-image.' },
-				lora: { type: 'string', description: 'Exact LoRA file name from draw_models includeLoras, to apply on top of the base model.' },
-				loraStrength: { type: 'number', description: 'LoRA model strength. Defaults to 1.' },
-				image: { type: 'string', description: 'Reference image for img2img/edit: a local absolute file path, or an attachment sha256 id. Defaults to the newest image in the conversation.' },
-				image2: { type: 'string', description: 'Second reference image for workflows that accept two, such as qwen21-edit.' },
+				workflow: { type: 'string', description: 'Workflow id from draw_workflows.' },
+				prompt: { type: 'string', description: 'The finished positive prompt.' },
+				negative: { type: 'string', description: 'Negative prompt, for workflows that expose one.' },
+				width: { type: 'integer', description: 'Output width in pixels. Defaults to the workflow value.' },
+				height: { type: 'integer', description: 'Output height in pixels. Defaults to the workflow value.' },
+				steps: { type: 'integer', description: 'Sampling steps. Defaults to the workflow value.' },
+				cfg: { type: 'number', description: 'CFG scale. Defaults to the workflow value.' },
+				denoise: { type: 'number', description: 'Denoise strength, for img2img workflows.' },
+				seed: { type: 'integer', description: 'Seed. Omit for a random one; the used seed is reported back.' },
+				lora: { type: 'string', description: 'Exact LoRA file name from draw_models, applied on top of the base model.' },
+				loraStrength: { type: 'number', description: 'LoRA strength for both model and clip. Defaults to 1.' },
+				image: { type: 'string', description: 'Input image for img2img/edit: a local absolute file path, or an attachment sha256 id. Defaults to the newest image in the conversation.' },
+				image2: { type: 'string', description: 'Second input image, for workflows with two image inputs.' },
 				filenamePrefix: { type: 'string', description: 'ComfyUI output filename prefix, usually left unset.' },
 			},
 			required: ['workflow', 'prompt'],
@@ -1217,9 +1573,9 @@ export function apply(ctx, config) {
 				const images = value.images ?? [];
 				const blocks = [{
 					type: 'text',
-					text: `${value.workflow}（${value.label}）出图 ${images.length} 张 · ${value.width}x${value.height} · ${value.steps} 步 · cfg ${value.cfg} · seed ${value.seed} · ${value.elapsedMs}ms`
-						+ (value.lora ? ` · LoRA ${value.lora}` : '')
-						+ (value.savedTo?.length ? ` · 已存 ${value.savedTo.join(', ')}` : '')
+					text: value.workflow + '（' + value.label + '）出图 ' + images.length + ' 张 · ' + value.width + 'x' + value.height + ' · ' + value.steps + ' 步 · cfg ' + value.cfg + ' · seed ' + value.seed + ' · ' + value.elapsedMs + 'ms'
+						+ (value.lora ? ' · LoRA ' + value.lora : '')
+						+ (value.savedTo?.length ? ' · 已存 ' + value.savedTo.join(', ') : '')
 						+ '。图片已附加到对话。',
 				}];
 				for (const image of images) blocks.push({ type: 'image', attachment: image.attachment });
@@ -1229,10 +1585,14 @@ export function apply(ctx, config) {
 		timeoutMs: 900000,
 		isConcurrencySafe: () => false,
 		execute: async (args, exec) => {
+			await ensureSettings();
 			const started = Date.now();
-			const manifest = await loadManifest(cfg);
-			const entry = familyOf(manifest, String(args.workflow));
-			if (!entry) throw new Error(`没有这个工作流：${args.workflow}。可用：${manifest.workflows.map((w) => w.id).join(', ')}`);
+			const manifest = await discoverWorkflows(cfg);
+			const entry = workflowOf(manifest, String(args.workflow));
+			if (!entry) {
+				const known = manifest.workflows.map((w) => w.id).join(', ') || '（工作流目录是空的）';
+				throw new Error('没有这个工作流：' + args.workflow + '。可用：' + known);
+			}
 
 			await ensureComfy(cfg, log);
 			const workflow = await loadWorkflow(cfg, entry);
@@ -1242,25 +1602,23 @@ export function apply(ctx, config) {
 			const steps = numberOr(args.steps, defaults.steps);
 			const cfgScale = numberOr(args.cfg, defaults.cfg);
 			const denoise = numberOr(args.denoise, defaults.denoise);
+			const width = numberOr(args.width, defaults.width);
+			const height = numberOr(args.height, defaults.height);
 
 			setSlot(workflow, entry, 'prompt', args.prompt);
 			if (args.negative !== undefined) setSlot(workflow, entry, 'negative', args.negative);
-			setSlot(workflow, entry, 'width', numberOr(args.width, defaults.width));
-			setSlot(workflow, entry, 'height', numberOr(args.height, defaults.height));
-			setSlot(workflow, entry, 'resolution', defaults.resolution);
+			setSlot(workflow, entry, 'width', width);
+			setSlot(workflow, entry, 'height', height);
 			setSlot(workflow, entry, 'steps', steps);
 			setSlot(workflow, entry, 'cfg', cfgScale);
 			setSlot(workflow, entry, 'denoise', denoise);
 			setSlot(workflow, entry, 'seed', seed);
-			setSlot(workflow, entry, 'detailer_seed', seed);
-			setSlot(workflow, entry, 'detailer_denoise', defaults.detailer_denoise);
-			setSlot(workflow, entry, 'threshold', defaults.threshold);
-			setSlot(workflow, entry, 'character_threshold', defaults.character_threshold);
-			setSlot(workflow, entry, 'caption_length', defaults.caption_length);
-			setSlot(workflow, entry, 'prompt_style', defaults.prompt_style);
-			setSlot(workflow, entry, 'megapixels', defaults.megapixels);
 
-			if (args.lora) applyLora(workflow, entry, String(args.lora), numberOr(args.loraStrength, 1), numberOr(args.loraStrength, 1));
+			let loraApplied = false;
+			if (args.lora) {
+				loraApplied = applyLora(workflow, entry, String(args.lora), numberOr(args.loraStrength, 1), numberOr(args.loraStrength, 1));
+				if (!loraApplied) throw new Error('这个工作流里没有可挂 LoRA 的位置（找不到 LoraLoader，也找不到采样器的 model 与 clip 连线）');
+			}
 
 			if (entry.slots?.image) {
 				const staged = await stageImage(ctx, exec, cfg, args.image);
@@ -1301,13 +1659,13 @@ export function apply(ctx, config) {
 				workflow: entry.id,
 				label: entry.label,
 				images,
-				width: numberOr(args.width, defaults.width) ?? undefined,
-				height: numberOr(args.height, defaults.height) ?? undefined,
+				width,
+				height,
 				steps,
 				cfg: cfgScale,
 				seed,
 				denoise,
-				...(args.lora ? { lora: String(args.lora) } : {}),
+				...(loraApplied ? { lora: String(args.lora) } : {}),
 				promptId,
 				elapsedMs: Date.now() - started,
 				...(saved.savedTo?.length ? { savedTo: saved.savedTo, savedDir: saved.savedDir } : {}),
@@ -1320,51 +1678,53 @@ export function apply(ctx, config) {
 
 	ctx.effect(() => ctx.tools.register({
 		name: 'draw_reverse',
-		description: 'Reverse-engineer an image into a prompt written in the target model family dialect. For anima it runs a WD14 Danbooru tagger and returns a comma-separated tag string; for krea2 and qwen21 it runs JoyCaption and returns descriptive English prose. Reads the newest image in the conversation by default. Does not generate an image.',
+		description: 'Run a reverse workflow (a tagger or captioner such as WD14 or JoyCaption that outputs text) on an image and return the text. The workflow must already exist in workflowsDir and have an image input; draw_workflows shows which ones do. Reads the newest image in the conversation by default. Does not generate an image.',
 		parameters: {
 			type: 'object',
 			properties: {
-				target: { type: 'string', enum: ['anima', 'krea2', 'qwen21'], description: 'The model family the prompt will be used with. Decides which tagger runs.' },
+				workflow: { type: 'string', description: 'Workflow id of the reverse workflow. Optional when exactly one workflow in workflowsDir has an image input.' },
 				image: { type: 'string', description: 'Local absolute file path or attachment sha256. Defaults to the newest image in the conversation.' },
-				threshold: { type: 'number', description: 'Tag score threshold for the anima tagger. Defaults to 0.35.' },
-				captionLength: { type: 'string', enum: ['long', 'medium', 'short'], description: 'Caption length for krea2 and qwen21. Defaults to long.' },
 			},
-			required: ['target'],
 			additionalProperties: false,
 		},
 		output: {
 			schema: { type: 'object', additionalProperties: true },
 			render: (_args, value) => [{
 				type: 'text',
-				text: `反推完成（${value.target} / ${value.workflow}，${value.elapsedMs}ms）：\n\n${value.prompt}`,
+				text: '反推完成（' + value.workflow + '，' + value.elapsedMs + 'ms）：\n\n' + value.prompt,
 			}],
 		},
 		timeoutMs: 900000,
 		isConcurrencySafe: () => false,
 		execute: async (args, exec) => {
+			await ensureSettings();
 			const started = Date.now();
-			const manifest = await loadManifest(cfg);
-			const target = String(args.target);
-			const workflowId = target === 'anima' ? 'reverse-wd14' : 'reverse-joycaption';
-			const entry = familyOf(manifest, workflowId);
-			if (!entry) throw new Error(`工作流库里缺少 ${workflowId}`);
+			const manifest = await discoverWorkflows(cfg);
+			const candidates = manifest.workflows.filter((w) => w.slots?.image);
+			const id = args?.workflow ?? (candidates.length === 1 ? candidates[0].id : undefined);
+			if (!id) {
+				throw new Error(candidates.length === 0
+					? '工作流目录里没有带图片输入的工作流'
+					: '有多个候选，请指定 workflow：' + candidates.map((w) => w.id).join(', '));
+			}
+			const entry = workflowOf(manifest, String(id));
+			if (!entry) throw new Error('没有这个工作流：' + id);
+			if (!entry.slots?.image) throw new Error('工作流 ' + id + ' 没有图片输入，不能用来反推');
 
 			await ensureComfy(cfg, log);
 			const workflow = await loadWorkflow(cfg, entry);
 			const staged = await stageImage(ctx, exec, cfg, args.image);
 			workflow[entry.slots.image.node].inputs[entry.slots.image.input] = staged;
-			if (target === 'anima' && args.threshold !== undefined) setSlot(workflow, entry, 'threshold', args.threshold);
-			if (target !== 'anima' && args.captionLength !== undefined) setSlot(workflow, entry, 'caption_length', args.captionLength);
+			/* 反推只喂一张图：第二个 LoadImage 留着会去要一个不存在的占位图，直接摘掉。 */
+			if (entry.slots.image2) dropNode(workflow, entry.slots.image2.node);
 
 			const promptId = await submit(cfg, workflow, log);
 			const historyEntry = await waitHistory(cfg, promptId, cfg.timeoutMs);
-			const texts = collectTexts(historyEntry);
-			const prompt = texts.join('\n').trim();
-			if (!prompt) throw new Error('反推工作流跑完了但没读到文本输出');
+			const prompt = collectTexts(historyEntry).join('\n').trim();
+			if (!prompt) throw new Error('反推工作流跑完了但没读到文本输出：这个工作流可能只输出图片，或者文本没接到能回传的输出节点');
 
 			return {
-				target,
-				workflow: workflowId,
+				workflow: entry.id,
 				prompt,
 				elapsedMs: Date.now() - started,
 				promptId,

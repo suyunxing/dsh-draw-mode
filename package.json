@@ -1,7 +1,7 @@
 {
   "name": "dsh-draw-mode",
-  "version": "1.2.0",
-  "description": "Link a local ComfyUI server into DeepSeek Harness: workflow routing, parameter mapping, LoRA injection, headless auto-start, inline image delivery and per-model prompt reverse-engineering.",
+  "version": "2.0.0",
+  "description": "Link a local ComfyUI server into DeepSeek Harness. Ships as an empty framework: point it at the workflows you exported from ComfyUI, then generate, edit and reverse-engineer images from chat. Workflows are auto-discovered, parameters mapped, LoRA injected; headless auto-start, inline image delivery and a settings panel included.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -13,7 +13,6 @@
     "index.js",
     "client.js",
     "cordis.patch.yml",
-    "workflows/**/*.json",
     "README.md",
     "LICENSE",
     "icon-180.png"

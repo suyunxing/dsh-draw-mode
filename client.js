@@ -1,9 +1,10 @@
 /**
  * @local/dsh-draw — 画图模式面板（浏览器半边）
  *
- * 在左侧全局导航里加一行「画图」，点开后在中央列显示画图模式的状态面板：
- * ComfyUI 连通性 / GPU 显存、三族模型规格、工作流库清单、最近出图缩略图。
- * 数据来自 Host 半边注册的只读 HTTP 接口（/draw-mode/api/*），与 Web GUI 同源。
+ * 在左侧全局导航里加一行「画图」，点开后在中央列显示画图模式面板：
+ * ComfyUI 连通性 / GPU 显存、工作流目录与清单、配置表单、最近出图缩略图。
+ * 数据来自 Host 半边注册的 HTTP 接口（/draw-mode/api/*），与 Web GUI 同源。
+ * 插件不自带工作流：这里显示的永远是用户自己放进 workflowsDir 的文件。
  */
 window.__ModuleLoader__.load({
   id: 'dsh-draw-mode',
@@ -50,12 +51,6 @@ window.__ModuleLoader__.load({
       if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) return '';
       const mb = bytes / 1048576;
       return mb >= 1 ? `${mb.toFixed(2)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
-    };
-
-    const FAMILY_META = {
-      anima: { name: 'Anima · SilvermoonMix', dialect: 'Danbooru 标签流，逗号分隔' },
-      krea2: { name: 'Krea 2 Turbo', dialect: '自然语言长句，摄影术语优先' },
-      qwen21: { name: 'Qwen-Image 2.1', dialect: '自然语言描述，可含中文字' },
     };
 
     const TASK_LABEL = {
@@ -298,6 +293,49 @@ window.__ModuleLoader__.load({
   .dshdraw-lbPrev,
   .dshdraw-lbNext { width: 38px; height: 38px; }
 }
+.dshdraw-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px 16px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-2);
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+.dshdraw-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.dshdraw-fieldWide { grid-column: 1 / -1; }
+.dshdraw-label {
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+  letter-spacing: 0.02em;
+}
+.dshdraw-input {
+  appearance: none;
+  font: inherit;
+  font-size: 12px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 5px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-3);
+  color: var(--dsw-alias-label-primary);
+}
+.dshdraw-input:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
+}
+.dshdraw-check { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.dshdraw-check input { accent-color: var(--dsw-alias-brand-primary); }
+.dshdraw-hint { color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 1.45; word-break: break-all; }
+.dshdraw-note { color: var(--dsw-alias-state-success-primary, #16a34a); font-size: 12px; }
+.dshdraw-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  background: var(--dsw-alias-bg-module-platform);
+  border-radius: 5px;
+  padding: 1px 5px;
+}
 .dshdraw-empty { color: var(--dsw-alias-label-tertiary); font-size: 12px; padding: 8px 0; }
 .dshdraw-error { color: var(--dsw-alias-state-error-primary, #b42318); font-size: 12px; }
 `;
@@ -328,6 +366,12 @@ window.__ModuleLoader__.load({
       const [starting, setStarting] = React.useState(false);
       const [viewer, setViewer] = React.useState(-1);
       const [note, setNote] = React.useState('');
+      const [editing, setEditing] = React.useState(false);
+      const [form, setForm] = React.useState(null);
+      const [saving, setSaving] = React.useState(false);
+      const [testing, setTesting] = React.useState(false);
+      const [tested, setTested] = React.useState(null);
+      const [notice, setNotice] = React.useState('');
       const openerRef = React.useRef(null);
 
       const load = React.useCallback(() => {
@@ -356,10 +400,83 @@ window.__ModuleLoader__.load({
           });
       };
 
+      // 打开表单时把服务端的原始值抄一份：用户改到一半刷新面板不该丢掉草稿。
+      const openEditor = () => {
+        const editable = state && state.editable;
+        if (!editable) return;
+        setForm({ ...editable });
+        setTested(null);
+        setNotice('');
+        setEditing(true);
+      };
+
+      const closeEditor = () => {
+        setEditing(false);
+        setForm(null);
+        setTested(null);
+        setNotice('');
+      };
+
+      const setField = (key) => (event) => {
+        const target = event && event.target;
+        if (!target) return;
+        const value = target.type === 'checkbox' ? Boolean(target.checked) : target.value;
+        setForm((prev) => ({ ...(prev || {}), [key]: value }));
+      };
+
+      // 空串表示「这条不覆盖，回落到插件配置」——Host 侧 writeSettings 就是这么处理的，
+      // 所以这里不做任何过滤，原样提交。
+      const save = () => {
+        if (!form) return;
+        setSaving(true);
+        setNotice('');
+        const payload = {
+          comfyBaseUrl: form.comfyBaseUrl,
+          comfyRoot: form.comfyRoot,
+          comfyPython: form.comfyPython,
+          comfyMain: form.comfyMain,
+          comfyWorkdir: form.comfyWorkdir,
+          comfyArgs: form.comfyArgs,
+          autoStart: form.autoStart,
+          modelsRoot: form.modelsRoot,
+          workflowsDir: form.workflowsDir,
+          outputDir: form.outputDir,
+          saveToWorkspace: form.saveToWorkspace,
+          workspaceFolder: form.workspaceFolder,
+          idleShutdown: form.idleShutdown,
+          idleShutdownMs: Math.round((Number(form.idleMinutes) || 0) * 60000),
+          idleShutdownScope: form.idleShutdownScope,
+          timeoutMs: form.timeoutMs,
+          startTimeoutMs: form.startTimeoutMs,
+        };
+        fetch(`${API}/config`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+          .then((res) => (res.ok ? res.json() : res.json().then((b) => Promise.reject(new Error((b && b.error) || `HTTP ${res.status}`)))))
+          .then((body) => {
+            setNotice('已保存，立即生效');
+            setForm(body && body.editable ? { ...body.editable } : form);
+            load();
+          })
+          .catch((error) => setNotice(`保存失败：${error && error.message ? error.message : error}`))
+          .finally(() => setSaving(false));
+      };
+
+      const test = () => {
+        setTesting(true);
+        setTested(null);
+        fetch(`${API}/test`, { method: 'POST' })
+          .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
+          .then((body) => setTested(body))
+          .catch((error) => setTested({ ok: false, online: false, error: String(error && error.message ? error.message : error) }))
+          .finally(() => setTesting(false));
+      };
+
       const online = Boolean(state && state.online);
       const stats = state && state.stats;
       const workflows = (state && state.workflows) || [];
-      const families = (state && state.families) || [];
       const recent = (state && state.recent) || [];
       const current = viewer >= 0 && viewer < recent.length ? recent[viewer] : null;
       const total = recent.length;
@@ -416,11 +533,39 @@ window.__ModuleLoader__.load({
       const config = state && state.config;
       const configHint = config
         ? [
-          config.modelsRoot ? `模型 ${config.modelsRoot}` : '模型目录未配置',
+          config.workflowsDir ? `工作流 ${config.workflowsDir}` : '工作流目录未配置',
+          config.modelsRoot ? `模型 ${config.modelsRoot}` : '',
           config.outputDir ? `出图 ${config.outputDir}` : (config.saveToWorkspace ? '出图存会话工作区' : '不保存出图'),
           !online && !config.comfyMain ? '未配置 ComfyUI 启动路径' : '',
         ].filter(Boolean).join(' · ')
         : '';
+      const workflowErrors = (state && state.workflowErrors) || [];
+
+      const field = (label, key, opts) => {
+        const options = opts || {};
+        const value = form && form[key] !== undefined && form[key] !== null ? form[key] : '';
+        return h('div', {
+          key: `f-${key}`,
+          className: options.wide ? 'dshdraw-field dshdraw-fieldWide' : 'dshdraw-field',
+        }, [
+          h('label', { key: 'l', className: 'dshdraw-label', htmlFor: `dshdraw-${key}` }, label),
+          h('input', {
+            key: 'i',
+            id: `dshdraw-${key}`,
+            className: 'dshdraw-input',
+            type: options.type || 'text',
+            value,
+            onChange: setField(key),
+            spellCheck: false,
+          }),
+          options.hint ? h('div', { key: 'h', className: 'dshdraw-hint' }, options.hint) : null,
+        ]);
+      };
+
+      const summaryItem = (label, value) => h('div', { key: `s-${label}`, className: 'dshdraw-field' }, [
+        h('div', { key: 'l', className: 'dshdraw-label' }, label),
+        h('div', { key: 'v', className: 'dshdraw-strong' }, value || '—'),
+      ]);
 
       const statusLine = stats
         ? [
@@ -449,7 +594,7 @@ window.__ModuleLoader__.load({
         h('div', { key: 'head', className: 'dshdraw-head' }, [
           h('div', { key: 'txt', className: 'dshdraw-headText' }, [
             h('div', { key: 't', className: 'dshdraw-title' }, '画图模式'),
-            h('div', { key: 's', className: 'dshdraw-sub' }, '本地 ComfyUI · Anima / Krea2 / Qwen-Image 2.1 · 按模型扩写提示词与反推'),
+            h('div', { key: 's', className: 'dshdraw-sub' }, '本地 ComfyUI · 自带工作流即插即用 · 插件本身不带任何工作流与模型'),
           ]),
           h('div', { key: 'act', className: 'dshdraw-actions' }, [
             online
@@ -475,42 +620,120 @@ window.__ModuleLoader__.load({
         configHint ? h('div', { key: 'conf', className: 'dshdraw-dim dshdraw-conf' }, configHint) : null,
         failed ? h('div', { key: 'err', className: 'dshdraw-error' }, `接口异常：${failed}`) : null,
 
-        h('div', { key: 'families', className: 'dshdraw-section' }, [
-          h('div', { key: 't', className: 'dshdraw-sectionTitle' }, '模型族'),
-          h('div', { key: 'c', className: 'dshdraw-cards' }, families.map((family) => {
-            const meta = FAMILY_META[family.id] || { name: family.id, dialect: '' };
-            return h('div', { key: family.id, className: 'dshdraw-card' }, [
-              h('div', { key: 'n', className: 'dshdraw-cardName' }, meta.name),
-              h('div', { key: 'm', className: 'dshdraw-cardMeta' },
-                `${family.width}×${family.height} · ${family.steps} 步 · cfg ${family.cfg}`),
-              h('div', { key: 'd', className: 'dshdraw-cardDialect' }, meta.dialect),
-              h('div', { key: 'w', className: 'dshdraw-cardDialect' }, family.workflows.join(' · ')),
-            ]);
-          })),
+        h('div', { key: 'settings', className: 'dshdraw-section' }, [
+          h('div', { key: 'bar', className: 'dshdraw-actions' }, [
+            h('div', { key: 't', className: 'dshdraw-sectionTitle', style: { flex: 1, alignSelf: 'center' } }, '配置'),
+            editing
+              ? h('button', { key: 'test', type: 'button', className: 'dshdraw-btn', disabled: testing, onClick: test }, testing ? '测试中…' : '测试连接')
+              : null,
+            editing
+              ? h('button', { key: 'save', type: 'button', className: 'dshdraw-btn dshdraw-btnPrimary', disabled: saving, onClick: save }, saving ? '保存中…' : '保存')
+              : null,
+            h('button', {
+              key: 'edit',
+              type: 'button',
+              className: editing ? 'dshdraw-btn' : 'dshdraw-btn',
+              disabled: !state || !state.editable,
+              onClick: editing ? closeEditor : openEditor,
+            }, editing ? '取消' : '编辑'),
+          ]),
+
+          notice ? h('div', { key: 'notice', className: 'dshdraw-note' }, notice) : null,
+          tested
+            ? h('div', { key: 'tested', className: tested.online ? 'dshdraw-note' : 'dshdraw-error' },
+              tested.online
+                ? `连接正常：${tested.baseUrl}（${tested.device || '未知设备'}，显存 ${tested.vramFreeMb ?? '?'} MB 空闲），找到 ${tested.workflows} 个工作流`
+                : `连接失败：${tested.error || tested.baseUrl}`)
+            : null,
+
+          editing && form
+            ? h('div', { key: 'form', className: 'dshdraw-form' }, [
+              field('ComfyUI 地址', 'comfyBaseUrl', { hint: 'http://127.0.0.1:8188' }),
+              field('ComfyUI 安装目录', 'comfyRoot', { hint: '用于推导 python / main.py / 模型目录，可留空' }),
+              field('python 路径', 'comfyPython', { hint: '留空自动探测（便携包 python/、venv/）' }),
+              field('main.py 路径', 'comfyMain', { hint: '留空用 <安装目录>/ComfyUI/main.py' }),
+              field('工作目录', 'comfyWorkdir', { hint: '启动 ComfyUI 时的 cwd，留空同上' }),
+              field('启动参数', 'comfyArgs', { hint: '空格分隔，例如 --lowvram --preview-method auto' }),
+              field('模型目录', 'modelsRoot', { hint: '离线检查工作流要的模型在不在，留空自动推导' }),
+              field('工作流目录', 'workflowsDir', { wide: true, hint: '把 ComfyUI「Save (API Format)」导出的 JSON 放进这个目录' }),
+              field('出图目录', 'outputDir', { hint: '固定保存目录，留空则按下面的开关处理' }),
+              field('会话工作区子目录', 'workspaceFolder', { hint: '存到工作区时用的文件夹名' }),
+              field('空闲关闭阈值（分钟）', 'idleMinutes', { type: 'number', hint: '0 = 不关闭' }),
+              field('单次出图超时（毫秒）', 'timeoutMs', { type: 'number' }),
+              field('启动超时（毫秒）', 'startTimeoutMs', { type: 'number' }),
+              h('div', { key: 'scope', className: 'dshdraw-field' }, [
+                h('label', { key: 'l', className: 'dshdraw-label' }, '空闲关闭范围'),
+                h('select', {
+                  key: 'i',
+                  className: 'dshdraw-input',
+                  value: form.idleShutdownScope || 'spawned',
+                  onChange: setField('idleShutdownScope'),
+                }, [
+                  h('option', { key: 's', value: 'spawned' }, '仅本插件启动的进程'),
+                  h('option', { key: 'p', value: 'port' }, '端口上所有 ComfyUI'),
+                ]),
+              ]),
+              h('div', { key: 'checks', className: 'dshdraw-field dshdraw-fieldWide' }, [
+                h('label', { key: 'a', className: 'dshdraw-check' }, [
+                  h('input', { key: 'i', type: 'checkbox', checked: Boolean(form.autoStart), onChange: setField('autoStart') }),
+                  h('span', { key: 's' }, '不在线时自动无头启动'),
+                ]),
+                h('label', { key: 'b', className: 'dshdraw-check' }, [
+                  h('input', { key: 'i', type: 'checkbox', checked: Boolean(form.saveToWorkspace), onChange: setField('saveToWorkspace') }),
+                  h('span', { key: 's' }, '没设出图目录时，把图存进会话工作区'),
+                ]),
+                h('label', { key: 'c', className: 'dshdraw-check' }, [
+                  h('input', { key: 'i', type: 'checkbox', checked: Boolean(form.idleShutdown), onChange: setField('idleShutdown') }),
+                  h('span', { key: 's' }, '空闲后关闭 ComfyUI 释放显存'),
+                ]),
+              ]),
+              h('div', { key: 'file', className: 'dshdraw-hint dshdraw-fieldWide' },
+                `保存到 ${(state && state.settingsFile) || ''}；留空的项不覆盖插件配置。`),
+            ])
+            : h('div', { key: 'summary', className: 'dshdraw-form' }, [
+              summaryItem('ComfyUI', config ? config.baseUrl : ''),
+              summaryItem('工作流目录', config ? (config.workflowsDir || '未配置') : ''),
+              summaryItem('出图目录', config
+                ? (config.outputDir || (config.saveToWorkspace ? `会话工作区/${config.workspaceFolder}` : '不保存'))
+                : ''),
+              summaryItem('模型目录', config ? (config.modelsRoot || '未配置') : ''),
+              summaryItem('无头启动', config
+                ? (config.autoStart ? `开启${config.comfyMain ? ` · ${config.comfyMain}` : ''}` : '关闭')
+                : ''),
+              summaryItem('空闲关闭', config
+                ? (config.idleShutdown ? `${Math.round(config.idleShutdownMs / 60000)} 分钟` : '关闭')
+                : ''),
+            ]),
         ]),
 
         h('div', { key: 'workflows', className: 'dshdraw-section' }, [
-          h('div', { key: 't', className: 'dshdraw-sectionTitle' }, `工作流库（${workflows.length}）`),
+          h('div', { key: 't', className: 'dshdraw-sectionTitle' }, `工作流（${workflows.length}）`),
+          (state && state.workflowsDir)
+            ? h('div', { key: 'dir', className: 'dshdraw-hint' }, `目录：${state.workflowsDir}`)
+            : h('div', { key: 'dir', className: 'dshdraw-hint' }, '还没配置工作流目录，点上面的「编辑」填一个'),
           workflows.length === 0
-            ? h('div', { key: 'e', className: 'dshdraw-empty' }, '暂无工作流')
+            ? h('div', { key: 'e', className: 'dshdraw-empty' },
+              '这个目录里还没有工作流。在 ComfyUI 里点「Save (API Format)」导出 JSON，丢进上面的目录，刷新即可。')
             : h('table', { key: 'tb', className: 'dshdraw-table' }, [
               h('thead', { key: 'h' }, h('tr', null, [
                 h('th', { key: 'a' }, '工作流'),
                 h('th', { key: 'b' }, '任务'),
-                h('th', { key: 'c' }, '族'),
-                h('th', { key: 'd' }, '默认尺寸'),
-                h('th', { key: 'e' }, '步数 / CFG'),
-                h('th', { key: 'f' }, '备注'),
+                h('th', { key: 'c' }, '默认参数'),
+                h('th', { key: 'd' }, '可传输入'),
+                h('th', { key: 'e' }, '备注'),
               ])),
               h('tbody', { key: 'b' }, workflows.map((wf) => h('tr', { key: wf.id }, [
-                h('td', { key: 'a' }, wf.id),
+                h('td', { key: 'a' }, wf.label && wf.label !== wf.id ? `${wf.label}\n${wf.id}` : wf.id),
                 h('td', { key: 'b' }, TASK_LABEL[wf.task] || wf.task),
-                h('td', { key: 'c' }, wf.family),
-                h('td', { key: 'd' }, wf.width ? `${wf.width}×${wf.height}` : '跟随输入'),
-                h('td', { key: 'e' }, wf.steps ? `${wf.steps} / ${wf.cfg}` : '—'),
-                h('td', { key: 'f' }, wf.notes || ''),
+                h('td', { key: 'c' }, Object.entries(wf.defaults || {}).map(([k, v]) => `${k}=${v}`).join(' ') || '—'),
+                h('td', { key: 'd' }, (wf.inputs || []).join(', ') || '—'),
+                h('td', { key: 'e' }, wf.notes || ''),
               ]))),
             ]),
+          workflowErrors.length === 0
+            ? null
+            : h('div', { key: 'errors', className: 'dshdraw-error' },
+              workflowErrors.map((e) => `${e.file}：${e.error}`).join('；')),
         ]),
 
         h('div', { key: 'recent', className: 'dshdraw-section' }, [
