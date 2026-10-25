@@ -1,6 +1,6 @@
 {
   "name": "dsh-draw-mode",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Link a local ComfyUI server into DeepSeek Harness. Ships as an empty framework: point it at the workflows you exported from ComfyUI, then generate, edit and reverse-engineer images from chat. Workflows are auto-discovered, parameters mapped, LoRA injected; headless auto-start, inline image delivery and a settings panel included.",
   "type": "module",
   "main": "index.js",
