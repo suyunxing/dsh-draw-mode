@@ -685,6 +685,7 @@ window.__ModuleLoader__.load({
               field('模型目录', 'modelsRoot', { hint: '离线检查工作流要的模型在不在，留空自动推导' }),
               field('工作流目录', 'workflowsDir', { wide: true, hint: '把 ComfyUI「Save (API Format)」导出的 JSON 放进这个目录' }),
               field('出图目录', 'outputDir', { hint: '固定保存目录，留空则按下面的开关处理' }),
+              field('最近出图目录', 'galleryDir', { wide: true, hint: '面板从这里列图（含子目录）；留空按出图目录 / 最近落盘 / ComfyUI output 兜底' }),
               field('会话工作区子目录', 'workspaceFolder', { hint: '存到工作区时用的文件夹名' }),
               field('空闲关闭阈值（分钟）', 'idleMinutes', { type: 'number', hint: '0 = 不关闭' }),
               field('单次出图超时（毫秒）', 'timeoutMs', { type: 'number' }),
@@ -724,6 +725,7 @@ window.__ModuleLoader__.load({
               summaryItem('出图目录', config
                 ? (config.outputDir || (config.saveToWorkspace ? `会话工作区/${config.workspaceFolder}` : '不保存'))
                 : ''),
+              summaryItem('最近出图目录', config ? (config.galleryDir || '未配置') : ''),
               summaryItem('模型目录', config ? (config.modelsRoot || '未配置') : ''),
               summaryItem('无头启动', config
                 ? (config.autoStart ? `开启${config.comfyMain ? ` · ${config.comfyMain}` : ''}` : '关闭')

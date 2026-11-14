@@ -137,6 +137,7 @@ modelMap:
 | `workflowsDir` | `''` | 放你导出的 API 格式工作流的目录，留空按 `comfyRoot` 推导。 |
 | `modelMap` | `{}` | `{ 'JSON 里的名字.gguf': '你本机的名字.gguf' }`，加载时改名，不必改 JSON。 |
 | `outputDir` | `''` | 固定出图目录；配了就一定存这里。 |
+| `galleryDir` | `''` | 面板「最近出图」从哪个目录列图（含子目录）；留空按 `outputDir` → 最近落盘 → `ComfyUI/output` 兜底。 |
 | `saveToWorkspace` | `true` | 否则存进会话工作区的 `workspaceFolder`。 |
 | `workspaceFolder` | `'draw-mode'` | 会话工作区内的子目录（绝对路径则原样使用）。 |
 | `idleShutdown` | *(未设)* | 显式开关：`false` 永不关，`true` 按 `idleShutdownMs`（未设时长则 15 分钟）。 |
@@ -319,6 +320,7 @@ Precedence: built-in defaults < plugin config (`cordis.patch.yml`) < `settings.j
 | `workflowsDir` | `''` | Folder holding your exported API-format workflows. `''` derives it from `comfyRoot`. |
 | `modelMap` | `{}` | `{ 'name-in-json.gguf': 'name-on-disk.gguf' }` — rewrite checkpoint names at load time instead of editing JSON. |
 | `outputDir` | `''` | Fixed folder for generated images. When set, images are always written there. |
+| `galleryDir` | `''` | Folder the panel's "recent outputs" lists, subdirectories included; empty falls back to `outputDir` → last save folder → `ComfyUI/output`. |
 | `saveToWorkspace` | `true` | Otherwise: save into the session workspace under `workspaceFolder`. |
 | `workspaceFolder` | `'draw-mode'` | Folder inside the session workspace (absolute paths are used as-is). |
 | `idleShutdown` | *(unset)* | Explicit switch: `false` never shuts down, `true` always uses `idleShutdownMs` (15 min when unset). |

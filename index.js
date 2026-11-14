@@ -51,6 +51,9 @@ const DEFAULTS = {
 	/* ---------------------------------------------------------- 出图保存 */
 	/* 固定保存目录（绝对路径，支持 ~ 与 %VAR%）。设置后优先于 workspaceFolder。 */
 	outputDir: '',
+	/* 面板「最近出图」从哪个目录列图（支持 ~ 与 %VAR%）。留空时依次回落到
+	   固定 outputDir、最近一次落盘目录、<comfyRoot>/ComfyUI/output。 */
+	galleryDir: '',
 	saveToWorkspace: true,
 	workspaceFolder: 'draw-mode',
 	/* 空闲自动关闭的显式开关：false 强制关闭，true 强制开启（用下面的时长）。
@@ -348,14 +351,26 @@ function nodesWhere(wf, predicate) {
 function detectSlots(wf) {
 	const slots = {};
 
-	/* 正向 / 负向提示词：文本编码节点里写死的字符串 text。
-	   先看节点标题里的 pos/neg，没有就按节点 id 顺序取前两个。 */
-	const textNodes = nodesWhere(wf, (n) => TEXT_CLASS.test(String(n.class_type ?? '')) && typeof n.inputs?.text === 'string');
+	/* 正向 / 负向提示词：文本编码节点里写死的字符串。
+	   先看节点标题里的 pos/neg，没有就按节点 id 顺序取前两个。
+	   有些自定义编码节点（如 TextEncodeQwenImage21）把正负都放在同一个
+	   节点的 prompt / negative_prompt 里，也一并认。 */
+	const textNodes = nodesWhere(wf, (n) => TEXT_CLASS.test(String(n.class_type ?? ''))
+		&& (isLiteral(n.inputs?.text) || isLiteral(n.inputs?.prompt)));
+	const promptInput = ([, n]) => (isLiteral(n.inputs?.text) ? 'text' : 'prompt');
+	const negativeInput = ([, n]) => {
+		if (isLiteral(n.inputs?.negative_prompt)) return 'negative_prompt';
+		return isLiteral(n.inputs?.text) ? 'text' : undefined;
+	};
 	const byTitle = (re) => textNodes.find(([, n]) => re.test(String(n._meta?.title ?? '')))?.[0];
-	const positive = byTitle(/pos|正/i) ?? textNodes[0]?.[0];
-	const negative = byTitle(/neg|负/i) ?? textNodes.find(([id]) => id !== positive)?.[0];
-	if (positive) slots.prompt = { node: positive, input: 'text' };
-	if (negative) slots.negative = { node: negative, input: 'text' };
+	const positiveEntry = textNodes.find(([id]) => id === byTitle(/pos|正/i)) ?? textNodes[0];
+	if (positiveEntry) slots.prompt = { node: positiveEntry[0], input: promptInput(positiveEntry) };
+	const negativeEntry = textNodes.find(([id]) => id === byTitle(/neg|负/i))
+		?? textNodes.find(([id, n]) => id !== positiveEntry?.[0] && negativeInput([id, n]));
+	if (negativeEntry) slots.negative = { node: negativeEntry[0], input: negativeInput(negativeEntry) };
+	else if (positiveEntry && isLiteral(positiveEntry[1].inputs?.negative_prompt)) {
+		slots.negative = { node: positiveEntry[0], input: 'negative_prompt' };
+	}
 
 	/* 采样参数：KSampler / KSamplerAdvanced / SamplerCustom。只认写死的字面量，
 	   连到别的节点的（link）不动，改了会断开连线。 */
@@ -799,9 +814,18 @@ async function saveOutputs(cfg, exec, images) {
 	return { savedTo: written, savedDir: dir };
 }
 
-/** 面板列图用的目录：固定 outputDir > 最近一次实际落盘目录。 */
+/** ComfyUI 自己的 output 目录，作为没配目录时的兜底列图位置。 */
+function comfyOutputDir(cfg) {
+	const root = configRoot(cfg);
+	return root ? path.join(root, 'ComfyUI', 'output') : '';
+}
+
+/** 面板列图用的目录：手动 galleryDir > 固定 outputDir > 最近落盘 > ComfyUI output。 */
 function outputListingDir(cfg) {
-	return fixedOutputDir(cfg) || ACTIVITY.lastSaveDir || '';
+	return expandPath(cfg.galleryDir, configRoot(cfg))
+		|| fixedOutputDir(cfg)
+		|| ACTIVITY.lastSaveDir
+		|| comfyOutputDir(cfg);
 }
 
 /** 工作流里这些 input key 的值是模型文件名，以及 ComfyUI 会去哪些子目录找它。 */
@@ -865,7 +889,7 @@ const SETTING_KEYS = [
 	'comfyBaseUrl', 'comfyRoot', 'comfyPython', 'comfyMain', 'comfyWorkdir', 'comfyArgs',
 	'autoStart', 'startTimeoutMs', 'timeoutMs',
 	'modelsRoot', 'workflowsDir', 'modelMap',
-	'outputDir', 'saveToWorkspace', 'workspaceFolder',
+	'outputDir', 'galleryDir', 'saveToWorkspace', 'workspaceFolder',
 	'idleShutdown', 'idleShutdownMs', 'idlePollMs', 'idleShutdownScope',
 ];
 
@@ -957,7 +981,8 @@ function configView(cfg) {
 		autoStart: Boolean(cfg.autoStart),
 		modelsRoot: modelsRoot(cfg),
 		workflowsDir: expandPath(cfg.workflowsDir, configRoot(cfg)),
-		outputDir: outputListingDir(cfg),
+		outputDir: fixedOutputDir(cfg),
+		galleryDir: outputListingDir(cfg),
 		saveToWorkspace: Boolean(cfg.saveToWorkspace),
 		workspaceFolder: cfg.workspaceFolder,
 		idleShutdown: idle.enabled,
@@ -983,6 +1008,7 @@ function editableConfig(cfg) {
 		modelsRoot: cfg.modelsRoot ?? '',
 		workflowsDir: cfg.workflowsDir ?? '',
 		outputDir: cfg.outputDir ?? '',
+		galleryDir: cfg.galleryDir ?? '',
 		saveToWorkspace: Boolean(cfg.saveToWorkspace),
 		workspaceFolder: cfg.workspaceFolder ?? 'draw-mode',
 		idleShutdown: idle.enabled,
@@ -1058,7 +1084,31 @@ function resolveSeed(seed) {
 /* --------------------------------------------------- 面板 HTTP 接口 */
 
 const API_PREFIX = '/draw-mode/api';
-const IMAGE_NAME = /^[A-Za-z0-9._-]+\.(?:png|jpg|jpeg|webp|gif)$/;
+const IMAGE_EXT = /\.(?:png|jpg|jpeg|webp|gif)$/i;
+/* 一段路径名：不含分隔符、控制字符和 Windows 非法字符，不能是 . / ..，
+   不能以点或空格结尾（Windows 会静默去掉，导致路径对不上）。 */
+const IMAGE_SEGMENT = /^[^\\/:*?"<>|\x00-\x1f]+$/;
+
+/** 把面板传来的相对路径拆成安全的段；不合法返回 null。 */
+function imageRelPath(raw) {
+	if (typeof raw !== 'string' || raw === '') return null;
+	const parts = raw.split('/');
+	if (parts.length === 0 || parts.length > 8) return null;
+	for (const part of parts) {
+		if (!part || part === '.' || part === '..') return null;
+		if (part !== part.trim() || part.endsWith('.')) return null;
+		if (!IMAGE_SEGMENT.test(part)) return null;
+	}
+	if (!IMAGE_EXT.test(parts[parts.length - 1])) return null;
+	return parts.join('/');
+}
+
+/** 把相对路径解析到列图目录里；越界返回 null。 */
+function resolveGalleryImage(dir, rel) {
+	const root = path.resolve(dir);
+	const target = path.resolve(root, ...rel.split('/'));
+	return target.startsWith(root + path.sep) ? target : null;
+}
 
 function writeJson(res, status, body) {
 	const payload = JSON.stringify(body);
@@ -1073,22 +1123,36 @@ function writeJson(res, status, body) {
 async function recentImages(cfg) {
 	const dir = outputListingDir(cfg);
 	if (!dir) return [];
-	try {
-		const names = await readdir(dir);
-		const rows = [];
-		for (const name of names) {
-			if (!IMAGE_NAME.test(name)) continue;
+	const rows = [];
+	let seen = 0;
+	/* 递归列图：深度和文件数都封顶，避免把一整块盘扫穿。 */
+	const walk = async (current, prefix, depth) => {
+		if (depth > 6 || seen >= 20000) return;
+		let entries;
+		try {
+			entries = await readdir(current, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			if (seen >= 20000) return;
+			if (entry.name.startsWith('.')) continue;
+			const rel = prefix ? prefix + '/' + entry.name : entry.name;
+			if (depth < 6 && entry.isDirectory()) {
+				await walk(path.join(current, entry.name), rel, depth + 1);
+				continue;
+			}
+			if (!entry.isFile() || !IMAGE_EXT.test(entry.name)) continue;
+			seen += 1;
 			try {
-				const info = await stat(path.join(dir, name));
-				if (!info.isFile()) continue;
-				rows.push({ name, size: info.size, mtime: info.mtimeMs });
+				const info = await stat(path.join(current, entry.name));
+				rows.push({ name: rel, size: info.size, mtime: info.mtimeMs });
 			} catch { /* skip */ }
 		}
-		rows.sort((a, b) => b.mtime - a.mtime);
-		return rows.slice(0, 24);
-	} catch {
-		return [];
-	}
+	};
+	await walk(dir, '', 0);
+	rows.sort((a, b) => b.mtime - a.mtime);
+	return rows.slice(0, 24);
 }
 
 /** 空闲关闭的实际开关与时长：idleShutdown 显式布尔优先，否则看 idleShutdownMs。 */
@@ -1262,13 +1326,21 @@ function registerPanelRoutes(ctx, cfg, baseCfg, ensureSettings, log) {
 			} catch {
 				name = '';
 			}
-			if (!IMAGE_NAME.test(name)) return writeJson(res, 400, { ok: false, error: 'bad-name' });
+			const rel = imageRelPath(name);
+			if (!rel) return writeJson(res, 400, { ok: false, error: 'bad-name' });
 			return guarded(res, async () => {
 				await ensureSettings();
 				const dir = outputListingDir(cfg);
 				if (!dir) return writeJson(res, 404, { ok: false, error: 'no-output-dir' });
-				const data = await readFile(path.join(dir, name));
-				const ext = path.extname(name).toLowerCase();
+				const target = resolveGalleryImage(dir, rel);
+				if (!target) return writeJson(res, 400, { ok: false, error: 'bad-name' });
+				let data;
+				try {
+					data = await readFile(target);
+				} catch {
+					return writeJson(res, 404, { ok: false, error: 'not-found' });
+				}
+				const ext = path.extname(rel).toLowerCase();
 				const type = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
 					: ext === '.webp' ? 'image/webp'
 						: ext === '.gif' ? 'image/gif'
@@ -1294,12 +1366,14 @@ function registerPanelRoutes(ctx, cfg, baseCfg, ensureSettings, log) {
 			} catch {
 				name = '';
 			}
-			if (!IMAGE_NAME.test(name)) return writeJson(res, 400, { ok: false, error: 'bad-name' });
+			const rel = imageRelPath(name);
+			if (!rel) return writeJson(res, 400, { ok: false, error: 'bad-name' });
 			return guarded(res, async () => {
 				await ensureSettings();
 				const dir = outputListingDir(cfg);
 				if (!dir) return writeJson(res, 404, { ok: false, error: 'no-output-dir' });
-				const target = path.join(dir, name);
+				const target = resolveGalleryImage(dir, rel);
+				if (!target) return writeJson(res, 400, { ok: false, error: 'bad-name' });
 				if (!existsSync(target)) return writeJson(res, 404, { ok: false, error: 'not-found' });
 				openInFileManager(target);
 				writeJson(res, 200, { ok: true, path: target });
