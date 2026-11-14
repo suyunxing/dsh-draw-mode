@@ -11,6 +11,8 @@
         saveToWorkspace: true
         workspaceFolder: 'draw-mode'
         # 出图停下来以后空闲超过 15 分钟就自动关掉 ComfyUI，释放显存与内存。
+        # 只关本插件无头拉起的实例：启动时记下 pid/创建时间/main.py，关之前逐个复核；
+        # 你手动打开的 ComfyUI 不在记录里，永远不会被自动关闭。
         # 改成 0 可以关闭这个行为；idlePollMs 是检查间隔。
         idleShutdownMs: 900000
         idlePollMs: 30000

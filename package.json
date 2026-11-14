@@ -4,6 +4,9 @@
   "description": "Link a local ComfyUI server into DeepSeek Harness: workflow routing, parameter mapping, LoRA injection, headless auto-start, inline image delivery and per-model prompt reverse-engineering.",
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test test/owned-comfy.test.mjs"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -11,6 +14,7 @@
   },
   "files": [
     "index.js",
+    "owned-comfy.js",
     "client.js",
     "cordis.patch.yml",
     "workflows/**/*.json",

@@ -11,6 +11,16 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import {
+	MAX_RECORDS,
+	loadOwned,
+	makeRecord,
+	planOwnedStop,
+	probeProcesses,
+	resolveStateFile,
+	saveOwned,
+} from './owned-comfy.js';
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WF_DIR = path.join(HERE, 'workflows');
 
@@ -26,6 +36,7 @@ const DEFAULTS = {
 	saveToWorkspace: true,
 	workspaceFolder: 'draw-mode',
 	/* 空闲自动关闭：出图停下来以后，超过这个时长没有任何新任务就杀掉 ComfyUI 释放显存。
+	   只杀本插件自己无头拉起的实例（见 owned-comfy.js 的归属校验）；用户手动打开的实例不在记录里，不会被碰。
 	   0 表示关闭该行为。 */
 	idleShutdownMs: 900000,
 	idlePollMs: 30000,
@@ -38,8 +49,54 @@ const ACTIVITY = {
 	lastStopPids: [],
 };
 
-/** 本插件自己无头启动的 ComfyUI 进程。 */
-const LAST_SPAWN = { pid: undefined };
+/** 本插件自己无头启动的 ComfyUI 记录（pid + 创建时间，跨 dsh 重启用文件保存）。
+    手动打开的实例没有记录，所以永远不会被空闲关闭碰到。 */
+const OWNED = {
+	file: resolveStateFile(),
+	records: [],
+	loaded: false,
+	loading: null,
+	/** 上一次「端口上是外部实例」的日志签名，避免每轮轮询刷同一句话。 */
+	lastExternalSignature: '',
+};
+
+/** 读磁盘上的归属记录；只读一次，之后用内存里的。 */
+function ownedLoad() {
+	if (OWNED.loaded) return Promise.resolve(OWNED.records);
+	if (!OWNED.loading) {
+		OWNED.loading = loadOwned(OWNED.file).then((stored) => {
+			const known = new Set(OWNED.records.map((item) => item.pid));
+			OWNED.records = stored.filter((item) => !known.has(item.pid)).concat(OWNED.records).slice(-MAX_RECORDS);
+			OWNED.loaded = true;
+			return OWNED.records;
+		});
+	}
+	return OWNED.loading;
+}
+
+/** 记下这次 spawn 的进程：空闲关闭只认这些。 */
+function ownedRemember(pid, cfg, r, port) {
+	const record = makeRecord({ pid, startedAt: Date.now(), port, root: cfg.comfyRoot, exe: path.basename(r.python), main: r.main });
+	void ownedLoad()
+		.then(() => {
+			OWNED.records = OWNED.records.filter((item) => item.pid !== pid).concat(record).slice(-MAX_RECORDS);
+			return saveOwned(OWNED.file, OWNED.records);
+		})
+		.catch(() => {
+			/* 状态文件写不进去只影响下次启动的判定，不影响出图 */
+		});
+}
+
+/** 记录作废（进程已退出，或 pid 已经被别的进程复用）。 */
+async function ownedForget(pids) {
+	const drop = new Set(pids);
+	OWNED.records = OWNED.records.filter((item) => !drop.has(item.pid));
+	try {
+		await saveOwned(OWNED.file, OWNED.records);
+	} catch {
+		/* 同上：清不掉也没关系，下一轮会再看 */
+	}
+}
 
 const MEDIA_EXT = {
 	'image/png': '.png',
@@ -105,7 +162,7 @@ function startComfy(cfg) {
 		windowsHide: true,
 	});
 	child.unref();
-	LAST_SPAWN.pid = child.pid;
+	ownedRemember(child.pid, cfg, r, String(port));
 	return child.pid;
 }
 
@@ -167,44 +224,80 @@ async function listenerPids(port) {
 function killTree(pid) {
 	return new Promise((resolve) => {
 		if (process.platform === 'win32') {
-			execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve(true));
+			execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, (error) => resolve(!error));
 			return;
 		}
 		try {
 			process.kill(pid, 'SIGTERM');
+			resolve(true);
 		} catch {
 			/* 进程可能已经退出 */
+			resolve(false);
 		}
-		resolve(true);
 	});
 }
 
-/** 杀掉 ComfyUI（连同子进程），并等到端口不再响应。 */
+/** 关掉本插件自己启动的 ComfyUI（连同子进程），并等到端口不再响应。
+    端口上属于别人的实例（用户手动打开的）一律不碰，只留一条日志。 */
 async function stopComfy(cfg, log) {
 	const port = new URL(cfg.comfyBaseUrl).port || '8188';
-	const pids = new Set(await listenerPids(port));
-	if (LAST_SPAWN.pid) pids.add(LAST_SPAWN.pid);
-	if (pids.size === 0) {
-		log?.(`空闲关闭：${port} 端口上没有监听进程，无需处理`);
+	const listeners = [...new Set(await listenerPids(port))];
+	await ownedLoad();
+
+	if (OWNED.records.length === 0) {
+		/* 没拉起过任何实例：端口上跑的一定是用户自己开的，不动 */
 		ACTIVITY.lastStopPids = [];
-		return { stopped: false, pids: [] };
+		logExternalOnce(port, listeners, log);
+		return { stopped: false, pids: [], external: listeners.length > 0 };
 	}
-	for (const pid of pids) await killTree(pid);
-	LAST_SPAWN.pid = undefined;
-	const list = [...pids];
+
+	const probe = await probeProcesses(OWNED.records.map((item) => item.pid));
+	const plan = planOwnedStop({ records: OWNED.records, listeners, probe, now: Date.now(), platform: process.platform });
+	if (plan.forget.length > 0) await ownedForget(plan.forget);
+
+	if (plan.kill.length === 0) {
+		ACTIVITY.lastStopPids = [];
+		logExternalOnce(port, listeners, log, plan.degraded ? '进程校验不可用，本次不自动关闭' : undefined);
+		return { stopped: false, pids: [], external: plan.external.length > 0, degraded: plan.degraded, skipped: plan.skipped };
+	}
+
+	const list = [...plan.kill];
+	const failed = [];
+	for (const pid of list) {
+		if (!(await killTree(pid))) failed.push(pid);
+	}
+	/* 只把真正杀掉的记录作废；没杀成功的留着，下一轮还有机会 */
+	const done = list.filter((pid) => !failed.includes(pid));
+	if (done.length > 0) await ownedForget(done);
+	OWNED.lastExternalSignature = '';
+	const note = failed.length > 0 ? `，${failed.join(', ')} 终止失败（可能权限不足）` : '';
 	const deadline = Date.now() + 30000;
 	while (Date.now() < deadline) {
 		await sleep(1000);
 		if (!(await comfyUp(cfg))) {
-			log?.(`空闲关闭：已终止 ComfyUI（pid ${list.join(', ')}），显存已释放`);
+			log?.(`空闲关闭：已终止本插件启动的 ComfyUI（pid ${list.join(', ')}），显存已释放${note}`);
 			ACTIVITY.lastStopPids = list;
-			return { stopped: true, pids: list };
+			return { stopped: true, pids: list, external: false };
 		}
 	}
 	const still = await comfyUp(cfg);
-	log?.(still ? `空闲关闭：已发终止信号（pid ${list.join(', ')}），但 ComfyUI 仍在响应` : `空闲关闭：已终止 ComfyUI（pid ${list.join(', ')}）`);
+	log?.(still
+		? `空闲关闭：已发终止信号（pid ${list.join(', ')}），但 ComfyUI 仍在响应${note}`
+		: `空闲关闭：已终止本插件启动的 ComfyUI（pid ${list.join(', ')}）${note}`);
 	ACTIVITY.lastStopPids = list;
 	return { stopped: !still, pids: list };
+}
+
+/** 端口上是别人启动的实例：不动进程，只记一句（同一个实例只记一次）。 */
+function logExternalOnce(port, listeners, log, why) {
+	if (listeners.length === 0) {
+		log?.(`空闲关闭：${port} 端口上没有本插件启动的 ComfyUI，无需处理`);
+		return;
+	}
+	const signature = `${port}:${listeners.slice().sort((a, b) => a - b).join(',')}`;
+	if (OWNED.lastExternalSignature === signature) return;
+	OWNED.lastExternalSignature = signature;
+	log?.(`空闲关闭：${port} 端口上的 ComfyUI（pid ${listeners.join(', ')}）不是本插件启动的，保持运行${why ? `（${why}）` : ''}`);
 }
 
 /* --------------------------------------------------------- 工作流库 */
@@ -591,6 +684,9 @@ function idleSnapshot(cfg) {
 		remainingMs: enabled ? Math.max(0, idleMs - idleFor) : 0,
 		lastShutdownAt: ACTIVITY.lastShutdownAt || undefined,
 		lastStopPids: ACTIVITY.lastStopPids,
+		/* 只有这些 pid 会被自动关闭：全部是本插件自己 spawn 的实例 */
+		ownedPids: OWNED.records.map((item) => item.pid),
+		ownedCount: OWNED.records.length,
 	};
 }
 
@@ -737,6 +833,9 @@ export const inject = ['tools'];
 
 export function apply(ctx, config) {
 	const cfg = { ...DEFAULTS, ...(config ?? {}) };
+
+	/* 记下本插件拉起过的实例（关停前要逐个核对，绝不误杀用户手开的） */
+	void ownedLoad();
 	const logs = [];
 
 	const log = (line) => logs.push(`[${new Date().toISOString()}] ${line}`);

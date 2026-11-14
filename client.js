@@ -403,8 +403,11 @@ window.__ModuleLoader__.load({
       }, [current, closeViewer, stepViewer]);
 
       const idle = state && state.idle;
+      const mine = !!(idle && Array.isArray(idle.ownedPids) && idle.ownedPids.length > 0);
       const idleHint = idle && idle.enabled
-        ? `空闲 ${Math.round(idle.idleMs / 60000)} 分钟后自动关闭${online ? `（剩 ${Math.max(0, Math.round(idle.remainingMs / 60000))} 分）` : ''}`
+        ? (online && !mine
+          ? '当前实例不是插件启动的，不会自动关闭'
+          : `空闲 ${Math.round(idle.idleMs / 60000)} 分钟后关闭插件启动的实例${online ? `（剩 ${Math.max(0, Math.round(idle.remainingMs / 60000))} 分）` : ''}`)
         : '';
 
       const statusLine = stats
