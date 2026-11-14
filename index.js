@@ -480,7 +480,22 @@ function resolveSeed(seed) {
 /* --------------------------------------------------- 面板 HTTP 接口 */
 
 const API_PREFIX = '/draw-mode/api';
-const IMAGE_NAME = /^[A-Za-z0-9._-]+\.(?:png|jpg|jpeg|webp|gif)$/;
+const IMAGE_EXT = /\.(?:png|jpg|jpeg|webp|gif)$/i;
+const IMAGE_SEGMENT = /^[^\\/:*?"<>|\x00-\x1f]+$/;
+
+/** 查询里的相对路径（可含 / 子目录）→ 安全形式；非法返回 null。 */
+function imageRelPath(raw) {
+	if (typeof raw !== 'string') return null;
+	const value = raw.replace(/\\/g, '/');
+	if (!value || value.startsWith('/')) return null;
+	const parts = value.split('/');
+	if (parts.length > 8) return null;
+	for (const part of parts) {
+		if (part === '.' || part === '..' || !IMAGE_SEGMENT.test(part)) return null;
+		if (/[. ]$/.test(part)) return null;
+	}
+	return IMAGE_EXT.test(parts[parts.length - 1]) ? parts.join('/') : null;
+}
 
 function writeJson(res, status, body) {
 	const payload = JSON.stringify(body);
@@ -493,24 +508,59 @@ function writeJson(res, status, body) {
 }
 
 async function recentImages(cfg) {
-	const dir = path.join(roots(cfg).output, 'draw');
-	try {
-		const { readdir, stat } = await import('node:fs/promises');
-		const names = await readdir(dir);
-		const rows = [];
-		for (const name of names) {
-			if (!IMAGE_NAME.test(name)) continue;
+	const root = roots(cfg).output;
+	const { readdir, stat } = await import('node:fs/promises');
+	const rows = [];
+	let seen = 0;
+
+	const walk = async (dir, prefix, depth) => {
+		if (depth > 6 || seen >= 20000) return;
+		let entries;
+		try {
+			entries = await readdir(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			if (seen >= 20000) return;
+			const name = entry.name;
+			if (name.startsWith('.')) continue;
+			const rel = prefix ? prefix + '/' + name : name;
+			if (entry.isDirectory()) {
+				await walk(path.join(dir, name), rel, depth + 1);
+				continue;
+			}
+			if (!entry.isFile() || !IMAGE_EXT.test(name)) continue;
+			seen += 1;
 			try {
 				const info = await stat(path.join(dir, name));
-				if (!info.isFile()) continue;
-				rows.push({ name, size: info.size, mtime: info.mtimeMs });
+				if (info.isFile()) rows.push({ name: rel, size: info.size, mtime: info.mtimeMs });
 			} catch { /* skip */ }
 		}
-		rows.sort((a, b) => b.mtime - a.mtime);
-		return rows.slice(0, 24);
-	} catch {
-		return [];
+	};
+
+	await walk(root, '', 0);
+	rows.sort((a, b) => b.mtime - a.mtime);
+	return rows.slice(0, 24);
+}
+
+/* 相对路径 → output 下的真实文件；越界、目录或不存在都返回 null。 */
+async function resolveOutputImage(cfg, raw) {
+	const rel = imageRelPath(raw);
+	if (!rel) return null;
+	const root = path.resolve(roots(cfg).output);
+	/* 兼容旧链接：不带目录的名字先找 draw/，再找根目录。 */
+	const candidates = rel.includes('/') ? [rel] : ['draw/' + rel, rel];
+	const { stat } = await import('node:fs/promises');
+	for (const candidate of candidates) {
+		const full = path.resolve(root, candidate);
+		if (full === root || !full.startsWith(root + path.sep)) continue;
+		try {
+			const info = await stat(full);
+			if (info.isFile()) return full;
+		} catch { /* try next */ }
 	}
+	return null;
 }
 
 function familyDigest(manifest) {
@@ -632,10 +682,13 @@ function registerPanelRoutes(ctx, cfg, log) {
 			} catch {
 				name = '';
 			}
-			if (!IMAGE_NAME.test(name)) return writeJson(res, 400, { ok: false, error: 'bad-name' });
+			const rel = imageRelPath(name);
+			if (!rel) return writeJson(res, 400, { ok: false, error: 'bad-name' });
 			try {
+				const target = await resolveOutputImage(cfg, rel);
+				if (!target) return writeJson(res, 404, { ok: false, error: 'not-found' });
 				const { readFile: read } = await import('node:fs/promises');
-				const data = await read(path.join(roots(cfg).output, 'draw', name));
+				const data = await read(target);
 				const ext = path.extname(name).toLowerCase();
 				const type = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
 					: ext === '.webp' ? 'image/webp'
@@ -664,9 +717,10 @@ function registerPanelRoutes(ctx, cfg, log) {
 			} catch {
 				name = '';
 			}
-			if (!IMAGE_NAME.test(name)) return writeJson(res, 400, { ok: false, error: 'bad-name' });
-			const target = path.join(roots(cfg).output, 'draw', name);
-			if (!existsSync(target)) return writeJson(res, 404, { ok: false, error: 'not-found' });
+			const rel = imageRelPath(name);
+			if (!rel) return writeJson(res, 400, { ok: false, error: 'bad-name' });
+			const target = await resolveOutputImage(cfg, rel);
+			if (!target) return writeJson(res, 404, { ok: false, error: 'not-found' });
 			try {
 				openInFileManager(target);
 				return writeJson(res, 200, { ok: true, path: target });
