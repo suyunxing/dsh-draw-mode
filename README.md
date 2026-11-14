@@ -22,7 +22,7 @@ Links a local **ComfyUI** server into DeepSeek Harness — driven by the workflo
   - `draw_generate` —— 跑工作流：文生图、图生图或改图，支持 LoRA 注入，并回传这次用的 seed。
   - `draw_reverse` —— 对一张图跑打标/反推工作流，返回文本。
 - **侧栏设置面板** —— 连通性、显卡、工作流目录与清单、最近出图缩略图，以及一个能改所有配置项的表单（存到 `~/.dsh/draw-mode/settings.json`，保存即生效，不用重启）。
-- **可选自动启停** —— 两项都**默认关闭**：工具需要时拉起 ComfyUI，队列空闲一段时间后关掉释放显存。空闲关闭默认只结束本插件自己拉起的进程；`idleShutdownScope: port` 才会扩大到 `comfyBaseUrl` 端口上的任何进程，包括你手动启动的 ComfyUI。
+- **可选自动启停** —— 两项都**默认关闭**：工具需要时拉起 ComfyUI，队列空闲一段时间后关掉释放显存。空闲关闭默认只结束本插件自己拉起的进程：启动时留下归属记录，关之前核对进程身份，对不上就不动手——你手动打开的 ComfyUI 永远不会被碰。`idleShutdownScope: port` 才会扩大到 `comfyBaseUrl` 端口上的任何进程。
 
 ### 环境要求
 
@@ -143,10 +143,17 @@ modelMap:
 | `idleShutdown` | *(未设)* | 显式开关：`false` 永不关，`true` 按 `idleShutdownMs`（未设时长则 15 分钟）。 |
 | `idleShutdownMs` | `0` | 空闲多久后关闭 ComfyUI；`0` = 关闭该功能。 |
 | `idlePollMs` | `30000` | 空闲检查的间隔。 |
-| `idleShutdownScope` | `'spawned'` | `spawned` 只关本插件拉起的；`port` 连你手动启动的也一起关。 |
+| `idleShutdownScope` | `'spawned'` | `spawned` 只关本插件拉起的（带归属记录 + 身份校验）；`port` 连你手动启动的也一起关。 |
 | `settingsPath` | `''` | 面板保存的位置，`''` = `~/.dsh/draw-mode/settings.json`；只能由插件配置指定，设置文件改不了自己。 |
 
 所有路径值都接受 `~`、`%VAR%`、`${VAR}` 和相对路径（按 `comfyRoot` 解析）。
+
+### 空闲关闭到底会关掉谁
+
+- 只有本插件无头拉起过的实例才有资格。拉起时写一条归属记录（`~/.dsh/storages/dsh-draw-mode/owned-comfy.json`；没有 `DSH_HOME` 时 Windows 落在 `%LOCALAPPDATA%\dsh-draw-mode\`，其它平台在 `~/.local/state/`），dsh 重启不丢。
+- 关之前逐个复核：进程还在、确实是 python、命令行指向记录里那个 `main.py`、创建时间与记录对得上（容差 2 分钟）。任何一条不满足就只清记录、不杀进程——你手动打开的实例数不到它，pid 被系统回收再分配也骗不过去。
+- 拿不到进程表（PowerShell 被策略挡住等）时宁可不关，日志写「进程校验不可用，本次不自动关闭」。
+- 端口上是别人的实例：进程照跑，日志记一句「不是本插件启动的，保持运行」，同一个实例只记一次。
 
 ```yaml
 - insert:
@@ -205,7 +212,7 @@ The plugin ships **no workflows and no models**. Drop your own `Save (API Format
   - `draw_generate` — run a workflow: text-to-image, image-to-image or edit, with LoRA injection and the used seed reported back.
   - `draw_reverse` — run a tagger/captioner workflow on an image and return its text.
 - **A settings panel** in the sidebar: connectivity, GPU, workflow directory and list, recent thumbnails, and a form for every configuration value (saved to `~/.dsh/draw-mode/settings.json`, effective immediately, no restart).
-- **Optional auto-start / idle shutdown** — both **off by default**: start ComfyUI when a tool needs it, and stop it again after the queue has been idle to release VRAM. Idle shutdown only ends the process this plugin spawned itself; `idleShutdownScope: port` widens it to whatever listens on `comfyBaseUrl`'s port, including a ComfyUI you started by hand.
+- **Optional auto-start / idle shutdown** — both **off by default**: start ComfyUI when a tool needs it, and stop it again after the queue has been idle to release VRAM. Idle shutdown only ends the process this plugin spawned itself: it leaves an ownership record at spawn time and re-checks the process identity before killing, so a ComfyUI you started by hand is never touched. `idleShutdownScope: port` widens it to whatever listens on `comfyBaseUrl`'s port.
 
 ### Requirements
 
@@ -326,8 +333,15 @@ Precedence: built-in defaults < plugin config (`cordis.patch.yml`) < `settings.j
 | `idleShutdown` | *(unset)* | Explicit switch: `false` never shuts down, `true` always uses `idleShutdownMs` (15 min when unset). |
 | `idleShutdownMs` | `0` | Idle delay before stopping ComfyUI. `0` = disabled. |
 | `idlePollMs` | `30000` | How often the idle check runs. |
-| `idleShutdownScope` | `'spawned'` | `spawned` stops only what this plugin started; `port` also stops whatever listens on `comfyBaseUrl`'s port. |
+| `idleShutdownScope` | `'spawned'` | `spawned` stops only what this plugin started (ownership record + identity check); `port` also stops whatever listens on `comfyBaseUrl`'s port. |
 | `settingsPath` | `''` | Where the panel saves. `''` = `~/.dsh/draw-mode/settings.json`. Read from the plugin config only; the settings file cannot move itself. |
+
+### Which ComfyUI gets stopped
+
+- Only instances this plugin started headlessly qualify. Each spawn writes an ownership record (`~/.dsh/storages/dsh-draw-mode/owned-comfy.json`; `%LOCALAPPDATA%\dsh-draw-mode\` on Windows without `DSH_HOME`, `~/.local/state/` elsewhere), so it survives a dsh restart.
+- Before killing, the process is re-checked: still alive, actually python, command line pointing at the recorded `main.py`, and its creation time within 2 minutes of the record. Any mismatch drops the stale record and leaves the process alone — a hand-started instance is never counted, and a recycled pid cannot fool it.
+- If the process table cannot be read (PowerShell blocked by policy, etc.) it does not kill anything and logs "process verification unavailable, skipping".
+- An instance on the port that is not ours keeps running; the log says so once per instance.
 
 All path values accept `~`, `%VAR%`, `${VAR}` and relative paths (resolved against `comfyRoot`).
 

@@ -11,6 +11,7 @@
   },
   "files": [
     "index.js",
+    "owned-comfy.js",
     "client.js",
     "cordis.patch.yml",
     "README.md",
@@ -26,6 +27,9 @@
       "immediately": true,
       "inject": []
     }
+  },
+  "scripts": {
+    "test": "node --test test/owned-comfy.test.mjs"
   },
   "engines": {
     "node": ">=22"

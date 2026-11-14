@@ -11,6 +11,15 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import {
+	MAX_RECORDS,
+	loadOwned,
+	makeRecord,
+	planOwnedStop,
+	probeProcesses,
+	resolveStateFile,
+	saveOwned,
+} from './owned-comfy.js';
 
 /* 面板里保存的配置写在这里；优先级：内置默认 < 插件 patch 里的 config < 这个文件。 */
 const DEFAULT_SETTINGS_PATH = path.join(homedir(), '.dsh', 'draw-mode', 'settings.json');
@@ -77,8 +86,54 @@ const ACTIVITY = {
 	lastSaveDir: '',
 };
 
-/** 本插件自己无头启动的 ComfyUI 进程。 */
-const LAST_SPAWN = { pid: undefined };
+/** 本插件自己无头启动的 ComfyUI 记录（pid + 创建时间，跨 dsh 重启存在文件里）。
+    你手动打开的实例没有记录，所以永远不会被空闲关闭碰到。 */
+const OWNED = {
+	file: resolveStateFile(),
+	records: [],
+	loaded: false,
+	loading: null,
+	/** 上一次「端口上是外部实例」的日志签名，避免每轮轮询刷同一句话。 */
+	lastExternalSignature: '',
+};
+
+/** 读磁盘上的归属记录；只读一次，之后用内存里的。 */
+function ownedLoad() {
+	if (OWNED.loaded) return Promise.resolve(OWNED.records);
+	if (!OWNED.loading) {
+		OWNED.loading = loadOwned(OWNED.file).then((stored) => {
+			const known = new Set(OWNED.records.map((item) => item.pid));
+			OWNED.records = stored.filter((item) => !known.has(item.pid)).concat(OWNED.records).slice(-MAX_RECORDS);
+			OWNED.loaded = true;
+			return OWNED.records;
+		});
+	}
+	return OWNED.loading;
+}
+
+/** 记下这次 spawn 的进程：空闲关闭只认这些。 */
+function ownedRemember(pid, cfg, p, port) {
+	const record = makeRecord({ pid, startedAt: Date.now(), port, root: cfg.comfyRoot, exe: path.basename(p.python), main: p.main });
+	void ownedLoad()
+		.then(() => {
+			OWNED.records = OWNED.records.filter((item) => item.pid !== pid).concat(record).slice(-MAX_RECORDS);
+			return saveOwned(OWNED.file, OWNED.records);
+		})
+		.catch(() => {
+			/* 状态文件写不进去只影响下次启动的判定，不影响出图 */
+		});
+}
+
+/** 记录作废（进程已退出，或 pid 已经被别的进程复用）。 */
+async function ownedForget(pids) {
+	const drop = new Set(pids);
+	OWNED.records = OWNED.records.filter((item) => !drop.has(item.pid));
+	try {
+		await saveOwned(OWNED.file, OWNED.records);
+	} catch {
+		/* 同上：清不掉也没关系，下一轮会再看 */
+	}
+}
 
 const MEDIA_EXT = {
 	'image/png': '.png',
@@ -214,7 +269,7 @@ function startComfy(cfg) {
 		windowsHide: true,
 	});
 	child.unref();
-	LAST_SPAWN.pid = child.pid;
+	ownedRemember(child.pid, cfg, p, String(port));
 	return child.pid;
 }
 
@@ -293,37 +348,82 @@ function idleShutdownScope(cfg) {
 	return cfg.idleShutdownScope === 'port' ? 'port' : 'spawned';
 }
 
-/** 关掉 ComfyUI（连同子进程），并等到端口不再响应。 */
+/** 关掉 ComfyUI（连同子进程），并等到端口不再响应。
+    'spawned'（默认）：只认本插件拉起过、并且还留有归属记录的进程。端口上属于别人的
+    实例（你手动打开的）一律不碰，连进程号都不复用——pid 被系统回收再分配时会被校验挡住。
+    'port'：显式选择的破坏性模式，端口上监听的进程全部结束。 */
 async function stopComfy(cfg, log) {
 	const port = new URL(cfg.comfyBaseUrl).port || '8188';
-	const scope = idleShutdownScope(cfg);
-	const pids = new Set();
-	/* 'port' 是破坏性的：端口上任何监听进程都会被算进来，包括不是本插件启动的。 */
-	if (scope === 'port') for (const pid of await listenerPids(port)) pids.add(pid);
-	if (LAST_SPAWN.pid) pids.add(LAST_SPAWN.pid);
-	if (pids.size === 0) {
-		log?.(scope === 'port'
-			? `空闲关闭：${port} 端口上没有监听进程，无需处理`
-			: `空闲关闭：没有本插件启动的 ComfyUI 可关（${port} 端口上的其他进程不动）`);
-		ACTIVITY.lastStopPids = [];
-		return { stopped: false, pids: [] };
+	const listeners = [...new Set(await listenerPids(port))];
+
+	/* 破坏性模式：用户显式配了 idleShutdownScope: 'port' 才会走到这里 */
+	if (idleShutdownScope(cfg) === 'port') {
+		if (listeners.length === 0) {
+			log?.(`空闲关闭：${port} 端口上没有监听进程，无需处理`);
+			ACTIVITY.lastStopPids = [];
+			return { stopped: false, pids: [] };
+		}
+		for (const pid of listeners) await killTree(pid);
+		return finishStop(cfg, listeners, [], log);
 	}
-	for (const pid of pids) await killTree(pid);
-	LAST_SPAWN.pid = undefined;
-	const list = [...pids];
+
+	await ownedLoad();
+
+	if (OWNED.records.length === 0) {
+		/* 本插件没拉起过任何实例：端口上跑的一定是你自己开的，不动 */
+		ACTIVITY.lastStopPids = [];
+		logExternalOnce(port, listeners, log);
+		return { stopped: false, pids: [], external: listeners.length > 0 };
+	}
+
+	const probe = await probeProcesses(OWNED.records.map((item) => item.pid));
+	const plan = planOwnedStop({ records: OWNED.records, listeners, probe, now: Date.now(), platform: process.platform });
+	if (plan.forget.length > 0) await ownedForget(plan.forget);
+
+	if (plan.kill.length === 0) {
+		ACTIVITY.lastStopPids = [];
+		logExternalOnce(port, listeners, log, plan.degraded ? '进程校验不可用，本次不自动关闭' : undefined);
+		return { stopped: false, pids: [], external: plan.external.length > 0, degraded: plan.degraded, skipped: plan.skipped };
+	}
+
+	const list = [...plan.kill];
+	const failed = [];
+	for (const pid of list) if (!(await killTree(pid))) failed.push(pid);
+	/* 只把真正杀掉的记录作废；没杀成功的留着，下一轮还有机会 */
+	const done = list.filter((pid) => !failed.includes(pid));
+	if (done.length > 0) await ownedForget(done);
+	OWNED.lastExternalSignature = '';
+	return finishStop(cfg, list, failed, log);
+}
+
+/** 杀完之后等端口安静下来，并按实际结果记日志。 */
+async function finishStop(cfg, list, failed, log) {
+	const note = failed.length > 0 ? `，${failed.join(', ')} 终止失败（可能权限不足）` : '';
 	const deadline = Date.now() + 30000;
 	while (Date.now() < deadline) {
 		await sleep(1000);
 		if (!(await comfyUp(cfg))) {
-			log?.(`空闲关闭：已终止 ComfyUI（pid ${list.join(', ')}），显存已释放`);
+			log?.(`空闲关闭：已终止 ComfyUI（pid ${list.join(', ')}），显存已释放${note}`);
 			ACTIVITY.lastStopPids = list;
 			return { stopped: true, pids: list };
 		}
 	}
 	const still = await comfyUp(cfg);
-	log?.(still ? `空闲关闭：已发终止信号（pid ${list.join(', ')}），但 ComfyUI 仍在响应` : `空闲关闭：已终止 ComfyUI（pid ${list.join(', ')}）`);
+	log?.(still ? `空闲关闭：已发终止信号（pid ${list.join(', ')}），但 ComfyUI 仍在响应${note}` : `空闲关闭：已终止 ComfyUI（pid ${list.join(', ')}）${note}`);
 	ACTIVITY.lastStopPids = list;
 	return { stopped: !still, pids: list };
+}
+
+/** 端口上是别人启动的实例：不动进程，只记一句（同一个实例只记一次）。 */
+function logExternalOnce(port, listeners, log, why) {
+	if (listeners.length === 0) {
+		log?.(`空闲关闭：${port} 端口上没有本插件启动的 ComfyUI，无需处理`);
+		return;
+	}
+	const signature = `${port}:${listeners.slice().sort((a, b) => a - b).join(',')}`;
+	if (OWNED.lastExternalSignature === signature) return;
+	OWNED.lastExternalSignature = signature;
+	log?.(`空闲关闭：${port} 端口上的 ComfyUI（pid ${listeners.join(', ')}）不是本插件启动的，保持运行${why ? `（${why}）` : ''}`);
 }
 
 /* --------------------------------------------------------- 工作流库 */
@@ -1171,6 +1271,9 @@ function idleSnapshot(cfg) {
 	return {
 		enabled,
 		scope: idleShutdownScope(cfg),
+		/* 本插件拉起过的 pid：面板据此分辨「这个 ComfyUI 是不是插件启动的」 */
+		ownedPids: OWNED.records.map((item) => item.pid),
+		ownedCount: OWNED.records.length,
 		idleMs: enabled ? idleMs : 0,
 		idleForMs: idleFor,
 		remainingMs: enabled ? Math.max(0, idleMs - idleFor) : 0,
@@ -1391,6 +1494,8 @@ export function apply(ctx, config) {
 	   baseCfg 是 patch 配置的快照，面板清空某项时回落到这里。 */
 	const baseCfg = { ...DEFAULTS, ...(config ?? {}) };
 	const cfg = { ...baseCfg };
+	/* 先把磁盘上的归属记录读进来：空闲关闭只认这些 pid，面板也用它提示 */
+	void ownedLoad();
 	const ensureSettings = settingsLoader(cfg);
 	const logs = [];
 

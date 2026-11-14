@@ -43,7 +43,9 @@
         #    未设时长则按 15 分钟）；不设则看 idleShutdownMs，>0 才开启。
         idleShutdownMs: 0
         idlePollMs: 30000
-        # 作用范围：'spawned' 只关本插件自己拉起的 ComfyUI（默认）；
+        # 作用范围：'spawned' 只关本插件自己无头拉起的 ComfyUI（默认）。拉起时会在
+        #   状态文件里留一条归属记录，关之前核对进程身份（可执行文件、命令行、创建时间），
+        #   对不上就只清记录、不杀进程；dsh 重启后记录仍在，拿不到进程表时宁可不关。
         # 'port' 会关掉 comfyBaseUrl 端口上的任何进程，包括你手动启动的那个。
         idleShutdownScope: 'spawned'
 

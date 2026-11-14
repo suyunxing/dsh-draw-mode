@@ -545,8 +545,12 @@ window.__ModuleLoader__.load({
       }, [current, closeViewer, stepViewer]);
 
       const idle = state && state.idle;
+      /* 本插件拉起过实例才有所有权记录；没有记录时端口上的 ComfyUI 一定是用户自己开的 */
+      const mine = !!(idle && Array.isArray(idle.ownedPids) && idle.ownedPids.length > 0);
       const idleHint = idle && idle.enabled
-        ? `空闲 ${Math.round(idle.idleMs / 60000)} 分钟后自动关闭${idle.scope === 'port' ? '（含端口上其他进程）' : '（仅本插件启动的进程）'}${online ? `（剩 ${Math.max(0, Math.round(idle.remainingMs / 60000))} 分）` : ''}`
+        ? (online && idle.scope !== 'port' && !mine
+          ? '当前实例不是插件启动的，不会自动关闭'
+          : `空闲 ${Math.round(idle.idleMs / 60000)} 分钟后自动关闭${idle.scope === 'port' ? '（含端口上其他进程）' : '（仅插件启动的进程）'}${online ? `（剩 ${Math.max(0, Math.round(idle.remainingMs / 60000))} 分）` : ''}`)
         : '';
 
       const config = state && state.config;
